@@ -64,6 +64,7 @@ A query is a list of steps separated by `.`, such as `Tim.age`. A query can't st
 | `*^` | object | every property key |
 | `/regex/` | object | every property value whose key matches `regex` |
 | `/regex/^` | object | every property key that matches `regex` |
+| `name^` | object | every property key that contains `name` |
 | `[]` | array | every element |
 | `[n]` | array | the element at index `n` |
 | `[start:stop]` | array | every element in a range, like a Python slice |
@@ -120,7 +121,7 @@ Values come back in the order they appear in the document.
 
 #### Properties after a fan-out
 
-Once a step has given several results (`*`, `*^`, `/regex/`, `/regex/^`, `[]` or a slice), later property steps work across all of them:
+Once a step has given several results (`*`, `*^`, `/regex/`, `/regex/^`, `name^`, `[]` or a slice), later property steps work across all of them:
 
 | Query | Output |
 |---|---|
@@ -186,6 +187,20 @@ Works like `*^`, but only for keys that match the regex. The regex follows the s
 
 With no steps after it, you get the matching keys as strings. With more steps after it, you get a new object that keeps only the matching keys, as described in [Steps after `*^`](#steps-after-). Keys that don't match are left out, so the remaining steps only need to suit the values you kept. `/^user_/^.age[]` works where `*^.age[]` fails.
 
+### Keys containing a name: `name^`
+
+A shorter way to write `/name/^` when the pattern is a plain name. It matches the same keys, but without a regex: it checks whether each key contains `name`.
+
+| Query | Output |
+|---|---|
+| `user^` | `["user_1","user_2"]` |
+| `user^.name` | `{"user_1":"ann","user_2":"bob"}` |
+| `red^.age` | `{"Fred":50}` |
+
+- Like `/name/`, the name only has to match **part** of the key, so `Tim^` also matches `Timothy`. Use `/^Tim$/^` to match the whole key.
+- The name follows the same rules as `name`: letters, `_` and `-`.
+- Without the `^`, `name` is a single property, not a pattern.
+
 ### Array elements: `[]`
 
 | Query | Output |
@@ -234,7 +249,7 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 | file or JSON errors | the file is missing, or the input isn't valid JSON | |
 
 On `null`:
-- `*`, `*^`, `/regex/` and `/regex/^` are errors.
+- `*`, `*^`, `/regex/`, `/regex/^` and `name^` are errors.
 - `name` and `[n]` return `null`, which is left out after a fan-out.
 - `[]` and `[start:stop]` give no results.
 - `{a,b}` returns an object whose listed properties are all `null`. Each path in it runs on `null`, so `{last.name}` gives `{"last":{"name":null}}`.

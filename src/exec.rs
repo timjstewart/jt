@@ -591,6 +591,20 @@ mod tests {
     }
 
     #[test]
+    fn eval_name_keys_match_like_regex_keys() {
+        let text = r#"{"Tim":{"age":53},"Timothy":{"age":20},"Fred":{"age":50}}"#;
+        assert_eq!(query("Tim^", text), r#"["Tim","Timothy"]"#);
+        assert_eq!(query("Tim^.age", text), r#"[{"Tim":53,"Timothy":20}]"#);
+        for (name, regex) in [
+            ("Tim^", "/Tim/^"),
+            ("Tim^.age", "/Tim/^.age"),
+            ("zz^", "/zz/^"),
+        ] {
+            assert_eq!(query(name, text), query(regex, text), "{name} vs {regex}");
+        }
+    }
+
+    #[test]
     fn eval_keys_in_document_order() {
         assert_eq!(query("*^", r#"{"b":1,"a":2,"c":3}"#), r#"["b","a","c"]"#);
         assert_eq!(query("*^", "{}"), "[]");

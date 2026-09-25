@@ -27,26 +27,37 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
-/// Selects the properties of an object by key: every key (`*`), or the keys a
-/// regex matches (`/regex/`). Compares equal to another with the same regex
-/// source.
+/// Selects the properties of an object by key.
 #[derive(Debug)]
-pub struct Pattern(Option<Regex>);
+pub enum Pattern {
+    /// Every key: `*`.
+    Any,
+    /// The keys that contain a name: `name^`. This matches the same keys as
+    /// `/name/^`, without a regex.
+    Contains(String),
+    /// The keys a regex matches: `/regex/`.
+    Regex(Regex),
+}
 
 impl Pattern {
-    /// Matches every key.
-    pub fn any() -> Self {
-        Self(None)
-    }
-
     pub fn is_match(&self, key: &str) -> bool {
-        self.0.as_ref().is_none_or(|regex| regex.is_match(key))
+        match self {
+            Self::Any => true,
+            Self::Contains(name) => key.contains(name.as_str()),
+            Self::Regex(regex) => regex.is_match(key),
+        }
     }
 }
 
+/// Regexes compare equal when they have the same source.
 impl PartialEq for Pattern {
     fn eq(&self, other: &Self) -> bool {
-        self.0.as_ref().map(Regex::as_str) == other.0.as_ref().map(Regex::as_str)
+        match (self, other) {
+            (Self::Any, Self::Any) => true,
+            (Self::Contains(a), Self::Contains(b)) => a == b,
+            (Self::Regex(a), Self::Regex(b)) => a.as_str() == b.as_str(),
+            _ => false,
+        }
     }
 }
 
@@ -59,9 +70,9 @@ pub enum Op {
     PropertyPick(Vec<PickEntry>),
     /// The values of the properties whose keys match: `*` or `/regex/`.
     PropertyValues(Pattern),
-    /// The keys that match: `*^` or `/regex/^`.
+    /// The keys that match: `*^`, `name^` or `/regex/^`.
     PropertyKeys(Pattern),
-    /// `*^` or `/regex/^` followed by more steps: a new object with the keys
+    /// `*^`, `name^` or `/regex/^` followed by more steps: a new object with the keys
     /// that match, where each value is the result of running the steps on the
     /// old value, shaped as described by `collect` in the exec module.
     PropertyMap(Pattern, Vec<Op>),
@@ -109,7 +120,7 @@ pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
     Ok(nest_after_keys(ops))
 }
 
-/// Replaces the first `*^` or `/regex/^` that has steps after it with a [`Op::PropertyMap`]
+/// Replaces the first `*^`, `name^` or `/regex/^` that has steps after it with a [`Op::PropertyMap`]
 /// holding those steps, and does the same within them.
 fn nest_after_keys(mut ops: Vec<Op>) -> Vec<Op> {
     if let Some(i) = ops.iter().position(|op| matches!(op, Op::PropertyKeys(_)))
@@ -224,17 +235,16 @@ fn parse_selector(chunk: &str) -> Result<Option<Op>, ParseError> {
         None => (chunk, false),
     };
     let pattern = if selector == "*" {
-        Pattern::any()
+        Pattern::Any
+    } else if let Some(source) = selector
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix('/'))
+    {
+        Pattern::Regex(Regex::new(source).map_err(|_| ParseError::InvalidQuery)?)
+    } else if keys && PROPERTY_REGEX.is_match(selector) {
+        Pattern::Contains(selector.to_owned())
     } else {
-        let Some(source) = selector
-            .strip_prefix('/')
-            .and_then(|rest| rest.strip_suffix('/'))
-        else {
-            return Ok(None);
-        };
-        Pattern(Some(
-            Regex::new(source).map_err(|_| ParseError::InvalidQuery)?,
-        ))
+        return Ok(None);
     };
     Ok(Some(if keys {
         Op::PropertyKeys(pattern)
@@ -330,7 +340,7 @@ mod tests {
     }
 
     fn re(pattern: &str) -> Op {
-        Op::PropertyValues(Pattern(Some(Regex::new(pattern).unwrap())))
+        Op::PropertyValues(Pattern::Regex(Regex::new(pattern).unwrap()))
     }
 
     #[test]
@@ -345,14 +355,14 @@ mod tests {
 
     #[test]
     fn parse_wildcard() {
-        assert_eq!(parse("*"), Ok(vec![Op::PropertyValues(Pattern::any())]));
+        assert_eq!(parse("*"), Ok(vec![Op::PropertyValues(Pattern::Any)]));
     }
 
     #[test]
     fn parse_wildcard_then_property() {
         assert_eq!(
             parse("*.age"),
-            Ok(vec![Op::PropertyValues(Pattern::any()), prop("age")])
+            Ok(vec![Op::PropertyValues(Pattern::Any), prop("age")])
         );
     }
 
@@ -380,25 +390,44 @@ mod tests {
 
     #[test]
     fn parse_chunk_wildcard() {
-        assert_eq!(parse_chunk("*"), Ok(Op::PropertyValues(Pattern::any())));
+        assert_eq!(parse_chunk("*"), Ok(Op::PropertyValues(Pattern::Any)));
     }
 
     #[test]
     fn parse_selectors() {
-        let regex = |s| Pattern(Some(Regex::new(s).unwrap()));
-        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::any())]));
+        let regex = |s| Pattern::Regex(Regex::new(s).unwrap());
+        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::Any)]));
         assert_eq!(parse("/a/"), Ok(vec![Op::PropertyValues(regex("a"))]));
         assert_eq!(parse("/a/^"), Ok(vec![Op::PropertyKeys(regex("a"))]));
         assert_eq!(parse("/a^/"), Ok(vec![Op::PropertyValues(regex("a^"))]));
         assert_eq!(parse("//^"), Ok(vec![Op::PropertyKeys(regex(""))]));
+        let contains = |s: &str| Pattern::Contains(s.to_owned());
+        assert_eq!(parse("Tim^"), Ok(vec![Op::PropertyKeys(contains("Tim"))]));
+        assert_eq!(
+            parse("a.first_name-x^.age"),
+            Ok(vec![
+                prop("a"),
+                Op::PropertyMap(contains("first_name-x"), vec![prop("age")])
+            ])
+        );
+    }
+
+    #[test]
+    fn pattern_contains_matches_like_regex_of_name() {
+        let contains = Pattern::Contains("im".to_owned());
+        let regex = Pattern::Regex(Regex::new("im").unwrap());
+        for key in ["Tim", "im", "Timothy", "Tom", "", "IM", "i-m"] {
+            assert_eq!(contains.is_match(key), regex.is_match(key), "key {key:?}");
+        }
     }
 
     #[test]
     fn pattern_any_matches_every_key() {
         for key in ["", "a", "é", "a.b"] {
-            assert!(Pattern::any().is_match(key), "key {key:?}");
+            assert!(Pattern::Any.is_match(key), "key {key:?}");
         }
-        assert_ne!(Pattern::any(), Pattern(Some(Regex::new("").unwrap())));
+        assert_ne!(Pattern::Any, Pattern::Regex(Regex::new("").unwrap()));
+        assert_ne!(Pattern::Any, Pattern::Contains(String::new()));
     }
 
     #[test]
@@ -408,7 +437,7 @@ mod tests {
 
     #[test]
     fn parse_chunk_rejects_invalid() {
-        for chunk in ["", "1", "a1", "a b", "**", "age^"] {
+        for chunk in ["", "1", "a1", "a b", "**", "age^^", "^age", "a1^"] {
             assert!(parse_chunk(chunk).is_err(), "expected error for {chunk:?}");
         }
     }
@@ -554,7 +583,7 @@ mod tests {
 
     #[test]
     fn pattern_equality_compares_source() {
-        let p = |s| Pattern(Some(Regex::new(s).unwrap()));
+        let p = |s| Pattern::Regex(Regex::new(s).unwrap());
         assert_eq!(p("^a+$"), p("^a+$"));
         assert_ne!(p("a"), p("b"));
         // Equivalent regexes with different source are not equal.
@@ -691,13 +720,13 @@ mod tests {
 
     #[test]
     fn parse_keys() {
-        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::any())]));
+        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::Any)]));
         for q in ["^", "a.^", "^.a", "*.^", "**^", "*^^", "^*"] {
             assert!(parse(q).is_err(), "expected error for {q:?}");
         }
         assert_eq!(
             parse("a.*^"),
-            Ok(vec![prop("a"), Op::PropertyKeys(Pattern::any())])
+            Ok(vec![prop("a"), Op::PropertyKeys(Pattern::Any)])
         );
         assert!(parse("^^").is_err());
     }
@@ -706,13 +735,13 @@ mod tests {
     fn parse_steps_after_keys_nest_in_a_property_map() {
         assert_eq!(
             parse("*^.a"),
-            Ok(vec![Op::PropertyMap(Pattern::any(), vec![prop("a")])])
+            Ok(vec![Op::PropertyMap(Pattern::Any, vec![prop("a")])])
         );
         assert_eq!(
             parse("*.*^.a[]"),
             Ok(vec![
-                Op::PropertyValues(Pattern::any()),
-                Op::PropertyMap(Pattern::any(), vec![prop("a"), Op::Array])
+                Op::PropertyValues(Pattern::Any),
+                Op::PropertyMap(Pattern::Any, vec![prop("a"), Op::Array])
             ])
         );
     }
@@ -722,28 +751,28 @@ mod tests {
         assert_eq!(
             parse("*^.*^"),
             Ok(vec![Op::PropertyMap(
-                Pattern::any(),
-                vec![Op::PropertyKeys(Pattern::any())]
+                Pattern::Any,
+                vec![Op::PropertyKeys(Pattern::Any)]
             )])
         );
         assert_eq!(
             parse("*^.a.*^.b"),
             Ok(vec![Op::PropertyMap(
-                Pattern::any(),
-                vec![prop("a"), Op::PropertyMap(Pattern::any(), vec![prop("b")])]
+                Pattern::Any,
+                vec![prop("a"), Op::PropertyMap(Pattern::Any, vec![prop("b")])]
             )])
         );
     }
 
     #[test]
     fn parse_regex_keys() {
-        let keys = |pattern: &str| Op::PropertyKeys(Pattern(Some(Regex::new(pattern).unwrap())));
+        let keys = |pattern: &str| Op::PropertyKeys(Pattern::Regex(Regex::new(pattern).unwrap()));
         assert_eq!(parse("/T.*/^"), Ok(vec![keys("T.*")]));
         assert_eq!(parse("a./x\\//^"), Ok(vec![prop("a"), keys(r"x\/")]));
         assert_eq!(
             parse("/T.*/^.name"),
             Ok(vec![Op::PropertyMap(
-                Pattern(Some(Regex::new("T.*").unwrap())),
+                Pattern::Regex(Regex::new("T.*").unwrap()),
                 vec![prop("name")]
             )])
         );
@@ -751,7 +780,7 @@ mod tests {
 
     #[test]
     fn parse_regex_keys_rejects_invalid() {
-        for q in ["/a/^^", "/a/^b", "/a/^/", "/(/^", "/^", "a^"] {
+        for q in ["/a/^^", "/a/^b", "/a/^/", "/(/^", "/^"] {
             assert!(parse(q).is_err(), "expected error for {q:?}");
         }
     }
