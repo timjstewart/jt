@@ -1,10 +1,12 @@
 use regex::Regex;
-use serde_json::{Value, from_str};
+use serde_json::{Value, from_str, to_string};
 use std::error::Error;
 use std::fmt;
 use std::fs::read_to_string;
 use std::process::ExitCode;
 use std::sync::OnceLock;
+
+use crate::ParseError::NotAnObject;
 
 static PROPERTY_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -14,14 +16,17 @@ fn get_property_regex() -> &'static Regex {
 
 #[derive(Debug, PartialEq)]
 enum ParseError {
-    Unknown,
+    UnknownError,
     NotAnObject,
+    NotAnArray,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            _ => write!(f, "unknown parse error"),
+            ParseError::UnknownError => write!(f, "unknown parse error"),
+            ParseError::NotAnObject => write!(f, "not an object"),
+            ParseError::NotAnArray => write!(f, "not an array"),
         }
     }
 }
@@ -32,6 +37,7 @@ impl Error for ParseError {}
 enum Op {
     Property(String),
     PropertyWildCard,
+    Array,
 }
 
 fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
@@ -39,7 +45,6 @@ fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
     let chunks = query.strip_prefix('.').unwrap_or(query).split('.');
 
     for chunk in chunks {
-        println!("CHUNK: {:?}", chunk);
         match parse_chunk(chunk) {
             Ok(ops) => result.extend(ops),
             Err(err) => println!("Error: {:?}", err),
@@ -53,8 +58,10 @@ fn parse_chunk(chunk: &str) -> Result<Vec<Op>, ParseError> {
         return Ok(vec![Op::PropertyWildCard]);
     } else if get_property_regex().is_match(chunk) {
         return Ok(vec![Op::Property(chunk.to_string())]);
+    } else if chunk == "[]" {
+        return Ok(vec![Op::Array]);
     };
-    Err(ParseError::Unknown)
+    Err(ParseError::UnknownError)
 }
 
 fn main() -> ExitCode {
@@ -65,41 +72,44 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    match parse(".*") {
+    match parse("[].*") {
         Ok(ops) => {
-            let text = read_to_string("input.json")?;
+            let text = read_to_string("ainput.json")?;
             let json: Value = from_str(&text)?;
-            execute(&ops, &json)?;
+            let out = execute(&ops, vec![json])?;
+            let result = to_string(&out)?;
+            println!("{}", result);
             Ok(())
         }
         Err(err) => {
             println!("Failed: {:?}", err);
-            Err(Box::new(ParseError::Unknown))
+            Err(Box::new(ParseError::UnknownError))
         }
     }
 }
 
-fn execute(ops: &Vec<Op>, json: &Value) -> Result<Value, ParseError> {
-    let result: Option<serde_json::Value> = None;
-
-    for op in ops {
-        match op {
-            Op::Property(name) => match json {
-                Value::Object(obj) => {
-                    if obj.contains_key(name) {
-                    } else {
-                    }
+fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ParseError> {
+    let Some((op, rest)) = ops.split_first() else {
+        return Ok(input);
+    };
+    let mut next_input = vec![];
+    for node in &input {
+        match node {
+            Value::Object(obj) => match op {
+                Op::Property(name) => {
+                    next_input.push(obj.get(name).cloned().unwrap_or(Value::Null))
                 }
-                _ => return Err(ParseError::NotAnObject),
+                Op::PropertyWildCard => next_input.extend(obj.values().cloned()),
+                _ => return Err(ParseError::NotAnArray),
             },
-            Op::PropertyWildCard => {}
+            Value::Array(array) => {
+                next_input.extend(array.iter().cloned())
+            },
+            _ => todo!()
         }
+        if let Value::Object(obj) = node {}
     }
-
-    match result {
-        Some(json) => Ok(json),
-        None => Err(ParseError::Unknown),
-    }
+    execute(rest, next_input)
 }
 
 #[cfg(test)]
