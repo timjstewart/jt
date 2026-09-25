@@ -3,15 +3,25 @@ use serde_json::{Value, from_str, to_string};
 use std::error::Error;
 use std::fmt;
 use std::fs::read_to_string;
+use std::ops::Range;
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
-use crate::ParseError::NotAnObject;
-
 static PROPERTY_REGEX: OnceLock<Regex> = OnceLock::new();
+static ARRAY_INDEX_REGEX: OnceLock<Regex> = OnceLock::new();
+static ARRAY_SLICE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn get_property_regex() -> &'static Regex {
     PROPERTY_REGEX.get_or_init(|| Regex::new("^[a-zA-Z_-]+$").unwrap())
+}
+
+fn get_array_index_regex() -> &'static Regex {
+    ARRAY_INDEX_REGEX.get_or_init(|| Regex::new(r"^\[([0-9]+)\]$").unwrap())
+}
+
+fn get_array_slice_regex() -> &'static Regex {
+    ARRAY_SLICE_REGEX
+        .get_or_init(|| Regex::new(r"^\[(-?[0-9]+)?:(-?[0-9]+)?\]$").unwrap())
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,17 +48,22 @@ enum Op {
     Property(String),
     PropertyWildCard,
     Array,
+    ArrayIndex(usize),
+    ArraySlice {
+        start: Option<isize>,
+        stop: Option<isize>,
+    },
 }
 
 fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
     let mut result = Vec::<Op>::new();
-    let chunks = query.strip_prefix('.').unwrap_or(query).split('.');
+    let query = query.strip_prefix('.').unwrap_or(query);
+    if query.is_empty() {
+        return Ok(result);
+    }
 
-    for chunk in chunks {
-        match parse_chunk(chunk) {
-            Ok(ops) => result.extend(ops),
-            Err(err) => println!("Error: {:?}", err),
-        }
+    for chunk in query.split('.') {
+        result.extend(parse_chunk(chunk)?);
     }
     Ok(result)
 }
@@ -60,25 +75,45 @@ fn parse_chunk(chunk: &str) -> Result<Vec<Op>, ParseError> {
         return Ok(vec![Op::Property(chunk.to_string())]);
     } else if chunk == "[]" {
         return Ok(vec![Op::Array]);
+    } else if let Some(caps) = get_array_index_regex().captures(chunk) {
+        let n = caps[1].parse().map_err(|_| ParseError::UnknownError)?;
+        return Ok(vec![Op::ArrayIndex(n)]);
+    } else if let Some(caps) = get_array_slice_regex().captures(chunk) {
+        let part = |i: usize| -> Result<Option<isize>, ParseError> {
+            caps.get(i)
+                .map(|m| m.as_str().parse().map_err(|_| ParseError::UnknownError))
+                .transpose()
+        };
+        return Ok(vec![Op::ArraySlice {
+            start: part(1)?,
+            stop: part(2)?,
+        }]);
     };
     Err(ParseError::UnknownError)
 }
 
+/// Range selected by a Python-style `[start:stop]` on a sequence of length `len`.
+fn slice_range(len: usize, start: Option<isize>, stop: Option<isize>) -> Range<usize> {
+    let n = len as isize;
+    // Negative bounds count from the end; out-of-range bounds clamp, as in Python.
+    let clamp = |i: isize| (if i < 0 { i + n } else { i }).clamp(0, n) as usize;
+    let start = start.map_or(0, clamp);
+    let stop = stop.map_or(len, clamp).max(start);
+    start..stop
+}
+
 fn main() -> ExitCode {
-    match run() {
+    match run("[0].*") {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    match parse("[].*") {
+fn run(query: &str) -> Result<(), Box<dyn Error>> {
+    match parse(query) {
         Ok(ops) => {
             let text = read_to_string("ainput.json")?;
-            let json: Value = from_str(&text)?;
-            let out = execute(&ops, vec![json])?;
-            let result = to_string(&out)?;
-            println!("{}", result);
+            println!("{}", eval(&ops, &text)?);
             Ok(())
         }
         Err(err) => {
@@ -86,6 +121,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             Err(Box::new(ParseError::UnknownError))
         }
     }
+}
+
+fn eval(ops: &[Op], text: &str) -> Result<String, Box<dyn Error>> {
+    let json: Value = from_str(text)?;
+    let out = execute(ops, vec![json])?;
+    Ok(to_string(&out)?)
 }
 
 fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ParseError> {
@@ -103,11 +144,31 @@ fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ParseError> {
                 _ => return Err(ParseError::NotAnArray),
             },
             Value::Array(array) => {
-                next_input.extend(array.iter().cloned())
+                match op {
+                    Op::Array => next_input.extend(array.iter().cloned()),
+                    Op::ArrayIndex(n) => next_input.push(array.get(*n).cloned().unwrap_or(Value::Null)),
+                    Op::ArraySlice { start, stop } => {
+                        let range = slice_range(array.len(), *start, *stop);
+                        next_input.push(Value::Array(array[range].to_vec()))
+                    }
+                    _ => return Err(ParseError::UnknownError),
+
+                }
+            }
+            Value::Null => match op {
+                Op::Property(_) | Op::ArrayIndex(_) | Op::ArraySlice { .. } => {
+                    next_input.push(Value::Null)
+                }
+                Op::PropertyWildCard => return Err(ParseError::NotAnObject),
+                Op::Array => return Err(ParseError::NotAnArray),
             },
-            _ => todo!()
+            _ => match op {
+                Op::Property(_) | Op::PropertyWildCard => return Err(ParseError::NotAnObject),
+                Op::Array | Op::ArrayIndex(_) | Op::ArraySlice { .. } => {
+                    return Err(ParseError::NotAnArray);
+                }
+            },
         }
-        if let Value::Object(obj) = node {}
     }
     execute(rest, next_input)
 }
@@ -118,6 +179,68 @@ mod tests {
 
     fn prop(name: &str) -> Op {
         Op::Property(name.to_string())
+    }
+
+    fn query(q: &str, text: &str) -> String {
+        eval(&parse(q).unwrap(), text).unwrap()
+    }
+
+    #[test]
+    fn run_rejects_invalid_query() {
+        assert!(run(".foo.$$").is_err());
+    }
+
+    #[test]
+    fn eval_empty_query_returns_input() {
+        assert_eq!(query(".", r#"{"a":1}"#), r#"[{"a":1}]"#);
+    }
+
+    #[test]
+    fn eval_property() {
+        assert_eq!(query(".a", r#"{"a":[1,2,3]}"#), "[[1,2,3]]");
+    }
+
+    #[test]
+    fn eval_nested_property() {
+        assert_eq!(query(".a.name", r#"{"a":{"name":"foo"}}"#), r#"["foo"]"#);
+    }
+
+    #[test]
+    fn eval_missing_property_is_null() {
+        assert_eq!(query(".nope.x", r#"{"a":1}"#), "[null]");
+    }
+
+    #[test]
+    fn eval_wildcard_then_property() {
+        let text = r#"{"b":{"name":"bar"},"a":{"name":"foo"}}"#;
+        assert_eq!(query(".*.name", text), r#"["bar","foo"]"#);
+    }
+
+    #[test]
+    fn eval_array_then_wildcard() {
+        let text = r#"[{"a":{"name":"foo"}},{"b":{"name":"bar"}}]"#;
+        assert_eq!(query("[].*", text), r#"[{"name":"foo"},{"name":"bar"}]"#);
+    }
+
+    #[test]
+    fn eval_array_index_then_wildcard() {
+        let text = r#"[{"a":{"name":"foo"}},{"b":{"name":"bar"}}]"#;
+        assert_eq!(query("[1].*", text), r#"[{"name":"bar"}]"#);
+    }
+
+    #[test]
+    fn eval_property_on_scalar_errors() {
+        assert!(eval(&parse(".a.x").unwrap(), r#"{"a":1}"#).is_err());
+    }
+
+    #[test]
+    fn eval_array_op_on_object_errors() {
+        assert!(eval(&parse("[]").unwrap(), r#"{"a":1}"#).is_err());
+    }
+
+    #[test]
+    fn eval_rejects_invalid_json() {
+        assert!(eval(&[], "{not json").is_err());
     }
 
     #[test]
@@ -174,5 +297,92 @@ mod tests {
         for chunk in ["", "1", "a1", "a b", "**", "age^"] {
             assert!(parse_chunk(chunk).is_err(), "expected error for {chunk:?}");
         }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_chunk() {
+        assert!(parse(".foo.$$.bar").is_err());
+        assert!(parse(".foo..bar").is_err());
+    }
+
+    #[test]
+    fn execute_property_on_null_yields_null() {
+        let input = serde_json::json!({"a": 1});
+        assert_eq!(
+            execute(&[prop("nope"), prop("x")], vec![input]),
+            Ok(vec![Value::Null])
+        );
+    }
+
+    #[test]
+    fn execute_property_on_scalar_errors() {
+        let input = serde_json::json!({"a": 1});
+        assert_eq!(
+            execute(&[prop("a"), prop("x")], vec![input]),
+            Err(ParseError::NotAnObject)
+        );
+    }
+
+    #[test]
+    fn execute_wildcard_preserves_document_order() {
+        let input: Value = from_str(r#"{"b": 1, "a": 2}"#).unwrap();
+        assert_eq!(
+            execute(&[Op::PropertyWildCard], vec![input]),
+            Ok(vec![Value::from(1), Value::from(2)])
+        );
+    }
+
+    #[test]
+    fn parse_slice() {
+        assert_eq!(
+            parse("[1:-2]"),
+            Ok(vec![Op::ArraySlice { start: Some(1), stop: Some(-2) }])
+        );
+        assert_eq!(
+            parse("[:]"),
+            Ok(vec![Op::ArraySlice { start: None, stop: None }])
+        );
+    }
+
+    #[test]
+    fn parse_slice_rejects_invalid() {
+        for q in ["[::2]", "[1:2:1]", "[1:2:3:4]", "[a:b]", "[1-:2]"] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
+    fn eval_slice_matches_python() {
+        // Expected values produced by Python on [0, 1, 2, 3, 4].
+        let cases = [
+            ("[1:3]", "[[1,2]]"),
+            ("[-2:]", "[[3,4]]"),
+            ("[:-1]", "[[0,1,2,3]]"),
+            ("[10:20]", "[[]]"),
+            ("[-10:2]", "[[0,1]]"),
+            ("[3:1]", "[[]]"),
+            ("[-1:-3]", "[[]]"),
+            ("[:]", "[[0,1,2,3,4]]"),
+            ("[:10]", "[[0,1,2,3,4]]"),
+        ];
+        for (q, expected) in cases {
+            assert_eq!(query(q, "[0,1,2,3,4]"), expected, "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn eval_slice_then_iterate() {
+        let text = r#"[{"n":"a"},{"n":"b"},{"n":"c"}]"#;
+        assert_eq!(query("[1:].[].n", text), r#"["b","c"]"#);
+    }
+
+    #[test]
+    fn eval_slice_on_null_is_null() {
+        assert_eq!(query(".nope.[1:2]", r#"{"a":1}"#), "[null]");
+    }
+
+    #[test]
+    fn eval_slice_on_object_errors() {
+        assert!(eval(&parse("[1:2]").unwrap(), r#"{"a":1}"#).is_err());
     }
 }
