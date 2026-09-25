@@ -1,5 +1,9 @@
 use regex::Regex;
-use serde_json::from_str;
+use serde_json::{Value, from_str};
+use std::error::Error;
+use std::fmt;
+use std::fs::read_to_string;
+use std::process::ExitCode;
 use std::sync::OnceLock;
 
 static PROPERTY_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -12,6 +16,16 @@ fn get_property_regex() -> &'static Regex {
 enum ParseError {
     Unknown,
 }
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ParseError::Unknown => write!(f, "unknown parse error"),
+        }
+    }
+}
+
+impl Error for ParseError {}
 
 #[derive(Debug, PartialEq)]
 enum Op {
@@ -42,15 +56,30 @@ fn parse_chunk(chunk: &str) -> Result<Vec<Op>, ParseError> {
     Err(ParseError::Unknown)
 }
 
-fn main() {
+fn main() -> ExitCode {
+    match run() {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     match parse(".*") {
-        Ok(result) => {
-            println!("RESULT: {:?}", result)
-        },
-        Err(err) => { 
-            println!("Failed: {:?}", err)
+        Ok(ops) => {
+            let text = read_to_string("input.json")?;
+            let json: Value = from_str(&text)?;
+            execute(&ops, &json)?;
+            Ok(())
         }
-    } 
+        Err(err) => {
+            println!("Failed: {:?}", err);
+            Err(Box::new(ParseError::Unknown))
+        }
+    }
+}
+
+fn execute<'a>(ops: &Vec<Op>, json: &'a Value) -> Result<&'a Value, ParseError> {
+    Ok(json)
 }
 
 #[cfg(test)]
