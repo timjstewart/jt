@@ -57,6 +57,7 @@ A query is a list of steps separated by `.`. The leading `.` is optional, so `.T
 | Step | Applies to | Result |
 |---|---|---|
 | `name` | object | the value of property `name` |
+| `{a,b}` | object | a new object with only properties `a` and `b` |
 | `*` | object | every property value |
 | `^` | object | every property key |
 | `/regex/` | object | every property value whose key matches `regex` |
@@ -80,6 +81,18 @@ A missing property gives `null`, and looking up a property of `null` also gives 
 
 Property names may contain only letters, `_` and `-`. To reach a key with other characters, such as `user_1`, use a regex: `/^user_1$/`.
 
+### Pick properties: `{a,b}`
+
+| Query | Output |
+|---|---|
+| `.Fred.{age,hobbies}` | `[{"age":50,"hobbies":["bridge","yodelling","chess"]}]` |
+| `*.{age}` | `[{"age":53},{"age":50},{"age":null},{"age":null}]` |
+| `{Tim,Fred}.Tim` | `[{"age":53}]` |
+
+- Builds a new object holding only the listed properties, in the order listed.
+- A missing property is included with the value `null`. On `null`, every listed property is `null`.
+- Names follow the same rules as `name`. Don't put spaces after the commas, and don't list a name twice.
+
 ### All properties: `*`
 
 | Query | Output |
@@ -99,7 +112,19 @@ Values come back in the order they appear in the document.
 
 Keys come back as strings, in document order. As with `*`, each key is a separate result, so `*.^` gives the keys of every object in one list, repeats included.
 
-`^` must be the last step. Keys are strings, and no step applies to a string, so a query like `.^.x` is rejected before any input is read.
+#### Steps after `^`
+
+When more steps follow `^`, the result is a new object with the same keys. Each value is the result of running the remaining steps on that key's old value. An object gives one new object, however many keys it has.
+
+| Query | Output |
+|---|---|
+| `.^.age` | `[{"Tim":53,"Fred":50,"user_1":null,"user_2":null}]` |
+| `.^.*` | `[{"Tim":53,"Fred":[50,["bridge","yodelling","chess"]],"user_1":"ann","user_2":"bob"}]` |
+| `.^.^` | `[{"Tim":"age","Fred":["age","hobbies"],"user_1":"name","user_2":"name"}]` |
+
+- A single result is stored as it is. When the steps give several results, or none, they are collected into an array, as `Fred` shows in `.^.*`.
+- The remaining steps run on every value, so they must suit all of them. `.^.hobbies.[]` fails with `not an array`, because only `Fred` has hobbies and `[]` on `null` is an error.
+- A second `^` in the remaining steps works the same way, one level down.
 
 ### Properties matching a regex: `/regex/`
 
@@ -152,8 +177,7 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 
 | Message | Cause | Example |
 |---|---|---|
-| `invalid query` | the query doesn't parse | `.Tim..age`, `.Tim.[-1]`, `/(/` |
-| `` `^` must be the last step `` | a step after `^` | `.^.x`, `.Fred.^.[0]` |
+| `invalid query` | the query doesn't parse | `.Tim..age`, `.Tim.[-1]`, `/(/`, `{Tim,Tim}` |
 | `not an object` | a property step on something that isn't an object | `.Tim.age.x`, `.Fred.hobbies.age` |
 | `not an array` | an array step on something that isn't an array | `.Tim.[]` |
 | file or JSON errors | the file is missing, or the input isn't valid JSON | |
@@ -161,3 +185,4 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 On `null`:
 - `*`, `^`, `/regex/` and `[]` are errors.
 - `name`, `[n]` and `[start:stop]` return `null`.
+- `{a,b}` returns an object whose listed properties are all `null`.

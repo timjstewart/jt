@@ -1,8 +1,16 @@
 {
-  "a": {
-    "name": "foo"
+  "Tim": {
+    "name": "foo",
+    "age": 33,
+    "hobbies": [
+      "golf"
+    ]
   },
-  "b": {
-    "name": "bar"
+  "Fred": {
+    "name": "bar",
+    "age": 29,
+    "hobbies": [
+      "bowling"
+    ]
   }
 }

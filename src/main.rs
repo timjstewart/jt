@@ -99,15 +99,6 @@ mod tests {
         assert!(eval(&[], "{not json".to_owned()).is_err());
     }
 
-    #[test]
-    fn run_rejects_steps_after_keys_before_reading_input() {
-        let err = run(".^.a", Some("no/such/file.json")).unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<ParseError>(),
-            Some(&ParseError::StepAfterKeys)
-        );
-    }
-
     fn render_query(q: &str, text: &str) -> String {
         let ops = parse(q).unwrap();
         render(&ops, &eval(&ops, text.to_owned()).unwrap()).unwrap()

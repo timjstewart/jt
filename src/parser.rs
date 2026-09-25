@@ -15,14 +15,12 @@ static ARRAY_SLICE_REGEX: LazyLock<Regex> =
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     InvalidQuery,
-    StepAfterKeys,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::InvalidQuery => f.write_str("invalid query"),
-            Self::StepAfterKeys => f.write_str("`^` must be the last step"),
         }
     }
 }
@@ -49,8 +47,14 @@ impl PartialEq for Pattern {
 pub enum Op {
     // Object operations
     Property(String),
+    /// A new object holding only the named properties, in the order listed: `{a,b}`.
+    PropertyPick(Vec<String>),
     PropertyWildcard,
     PropertyKeys,
+    /// `^` followed by more steps: a new object with the same keys, where each
+    /// value is the result of running the steps on the old value, or an array
+    /// of the results when there are none or several.
+    PropertyMap(Vec<Op>),
     PropertyRegex(Pattern),
     // Array operations
     Array,
@@ -70,13 +74,19 @@ pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
         .into_iter()
         .map(parse_chunk)
         .collect::<Result<_, _>>()?;
-    // Keys are strings, and no step applies to a string.
-    if let Some((_, before_last)) = ops.split_last()
-        && before_last.contains(&Op::PropertyKeys)
+    Ok(nest_after_keys(ops))
+}
+
+/// Replaces the first `^` that has steps after it with a [`Op::PropertyMap`]
+/// holding those steps, and does the same within them.
+fn nest_after_keys(mut ops: Vec<Op>) -> Vec<Op> {
+    if let Some(i) = ops.iter().position(|op| *op == Op::PropertyKeys)
+        && i + 1 < ops.len()
     {
-        return Err(ParseError::StepAfterKeys);
+        let rest = nest_after_keys(ops.split_off(i + 1));
+        ops[i] = Op::PropertyMap(rest);
     }
-    Ok(ops)
+    ops
 }
 
 /// Splits a query on `.`, except inside `/regex/` chunks, where `\/` escapes a slash.
@@ -132,6 +142,12 @@ fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
     if PROPERTY_REGEX.is_match(chunk) {
         return Ok(Op::Property(chunk.to_owned()));
     }
+    if let Some(list) = chunk
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return parse_property_list(list).map(Op::PropertyPick);
+    }
     if let Some(caps) = ARRAY_INDEX_REGEX.captures(chunk) {
         let n = caps[1].parse().map_err(|_| ParseError::InvalidQuery)?;
         return Ok(Op::ArrayIndex(n));
@@ -148,6 +164,19 @@ fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
         });
     }
     Err(ParseError::InvalidQuery)
+}
+
+/// Parses the `a,b` inside `{a,b}`. Names may not repeat, because each
+/// property is moved out of its object and can only be taken once.
+fn parse_property_list(list: &str) -> Result<Vec<String>, ParseError> {
+    let mut names: Vec<String> = vec![];
+    for name in list.split(',') {
+        if !PROPERTY_REGEX.is_match(name) || names.iter().any(|n| n == name) {
+            return Err(ParseError::InvalidQuery);
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -336,6 +365,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_pick() {
+        let props =
+            |names: &[&str]| Op::PropertyPick(names.iter().map(|n| n.to_string()).collect());
+        assert_eq!(parse(".a.{b,c}"), Ok(vec![prop("a"), props(&["b", "c"])]));
+        assert_eq!(parse("{b}"), Ok(vec![props(&["b"])]));
+        assert_eq!(
+            parse("{first_name,last-name}.x"),
+            Ok(vec![props(&["first_name", "last-name"]), prop("x")])
+        );
+    }
+
+    #[test]
+    fn parse_pick_rejects_invalid() {
+        for q in [
+            "{}", "{a,}", "{,a}", "{a b}", "{a, b}", "{a,a}", "{a", "a}", "{a}b", "{1}",
+        ] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
     fn parse_keys() {
         assert_eq!(parse(".^"), Ok(vec![Op::PropertyKeys]));
         assert_eq!(parse("^"), Ok(vec![Op::PropertyKeys]));
@@ -344,20 +394,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_steps_after_keys() {
-        for q in [
-            ".^.a", ".^.*", ".^.^", ".^.[]", ".^.[0]", ".^.[1:]", ".^./a/", "*.^.a",
-        ] {
-            assert_eq!(parse(q), Err(ParseError::StepAfterKeys), "query {q:?}");
-        }
+    fn parse_steps_after_keys_nest_in_a_property_map() {
+        assert_eq!(parse(".^.a"), Ok(vec![Op::PropertyMap(vec![prop("a")])]));
+        assert_eq!(
+            parse("*.^.a.[]"),
+            Ok(vec![
+                Op::PropertyWildcard,
+                Op::PropertyMap(vec![prop("a"), Op::Array])
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_nested_keys() {
+        assert_eq!(
+            parse(".^.^"),
+            Ok(vec![Op::PropertyMap(vec![Op::PropertyKeys])])
+        );
+        assert_eq!(
+            parse("^.a.^.b"),
+            Ok(vec![Op::PropertyMap(vec![
+                prop("a"),
+                Op::PropertyMap(vec![prop("b")])
+            ])])
+        );
     }
 
     #[test]
     fn parse_error_display() {
         assert_eq!(ParseError::InvalidQuery.to_string(), "invalid query");
-        assert_eq!(
-            ParseError::StepAfterKeys.to_string(),
-            "`^` must be the last step"
-        );
     }
 }

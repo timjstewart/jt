@@ -1,7 +1,7 @@
 //! Runs parsed queries against JSON values.
 
 use crate::parser::Op;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -45,9 +45,17 @@ fn apply(op: &Op, node: Value, out: &mut Vec<Value>) -> Result<(), ExecError> {
         (Op::Property(name), Value::Object(mut obj)) => {
             out.push(obj.remove(name).unwrap_or_default());
         }
+        (Op::PropertyPick(names), Value::Object(obj)) => out.push(pick(names, obj)),
         (Op::PropertyWildcard, Value::Object(obj)) => out.extend(obj.into_values()),
         (Op::PropertyKeys, Value::Object(obj)) => {
             out.extend(obj.into_iter().map(|(key, _)| Value::String(key)));
+        }
+        (Op::PropertyMap(ops), Value::Object(obj)) => {
+            let mapped = obj
+                .into_iter()
+                .map(|(key, value)| Ok((key, single_or_array(execute(ops, vec![value])?))))
+                .collect::<Result<_, _>>()?;
+            out.push(Value::Object(mapped));
         }
         (Op::PropertyRegex(pattern), Value::Object(obj)) => out.extend(
             obj.into_iter()
@@ -69,7 +77,17 @@ fn apply(op: &Op, node: Value, out: &mut Vec<Value>) -> Result<(), ExecError> {
         (Op::Property(_) | Op::ArrayIndex(_) | Op::ArraySlice { .. }, Value::Null) => {
             out.push(Value::Null);
         }
-        (Op::Property(_) | Op::PropertyWildcard | Op::PropertyKeys | Op::PropertyRegex(_), _) => {
+        // Every property of null is null, so picking from null gives all nulls, as in jq.
+        (Op::PropertyPick(names), Value::Null) => out.push(pick(names, Map::new())),
+        (
+            Op::Property(_)
+            | Op::PropertyPick(_)
+            | Op::PropertyWildcard
+            | Op::PropertyKeys
+            | Op::PropertyMap(_)
+            | Op::PropertyRegex(_),
+            _,
+        ) => {
             return Err(ExecError::NotAnObject);
         }
         (Op::Array | Op::ArrayIndex(_) | Op::ArraySlice { .. }, _) => {
@@ -77,6 +95,30 @@ fn apply(op: &Op, node: Value, out: &mut Vec<Value>) -> Result<(), ExecError> {
         }
     }
     Ok(())
+}
+
+/// The only value in `values`, or else all of them as an array.
+fn single_or_array(mut values: Vec<Value>) -> Value {
+    match values.pop() {
+        Some(value) if values.is_empty() => value,
+        Some(value) => {
+            values.push(value);
+            Value::Array(values)
+        }
+        None => Value::Array(values),
+    }
+}
+
+/// Builds an object holding only the properties `names` of `obj`, in that
+/// order, with `null` for any that are missing.
+fn pick(names: &[String], mut obj: Map<String, Value>) -> Value {
+    names
+        .iter()
+        .map(|name| {
+            obj.remove_entry(name)
+                .unwrap_or_else(|| (name.clone(), Value::Null))
+        })
+        .collect()
 }
 
 /// Range selected by a Python-style `[start:stop]` on a sequence of length `len`.
@@ -240,6 +282,52 @@ mod tests {
     }
 
     #[test]
+    fn eval_pick_keeps_listed_properties_in_listed_order() {
+        let text = r#"{"a":1,"b":{"n":2},"c":3}"#;
+        assert_eq!(query("{c,a}", text), r#"[{"c":3,"a":1}]"#);
+        assert_eq!(query("{b}", text), r#"[{"b":{"n":2}}]"#);
+        assert_eq!(query("{a,nope}", text), r#"[{"a":1,"nope":null}]"#);
+    }
+
+    #[test]
+    fn eval_pick_from_each_object() {
+        let text = r#"{"x":{"name":"foo","age":33,"h":[1]},"y":{"name":"bar","age":29,"h":[2]}}"#;
+        assert_eq!(
+            query("*.{name,age}", text),
+            r#"[{"name":"foo","age":33},{"name":"bar","age":29}]"#
+        );
+    }
+
+    #[test]
+    fn eval_pick_then_property() {
+        let text = r#"{"a":1,"b":2}"#;
+        assert_eq!(query("{b,a}.a", text), "[1]");
+    }
+
+    #[test]
+    fn eval_pick_on_null_gives_nulls() {
+        assert_eq!(query(".nope.{a,b}", "{}"), r#"[{"a":null,"b":null}]"#);
+    }
+
+    #[test]
+    fn execute_pick_on_non_object_errors() {
+        for input in [json!([{"a": 1}]), json!(1), json!("s")] {
+            assert_eq!(
+                exec("{a,b}", input.clone()),
+                Err(ExecError::NotAnObject),
+                "on {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_or_array_unwraps_only_a_single_value() {
+        assert_eq!(single_or_array(vec![json!([1])]), json!([1]));
+        assert_eq!(single_or_array(vec![json!(1), json!(2)]), json!([1, 2]));
+        assert_eq!(single_or_array(vec![]), json!([]));
+    }
+
+    #[test]
     fn slice_range_on_empty_sequence() {
         assert_eq!(slice_range(0, None, None), 0..0);
         assert_eq!(slice_range(0, Some(-1), Some(5)), 0..0);
@@ -367,6 +455,45 @@ mod tests {
     fn eval_keys_of_each_object() {
         let text = r#"{"x":{"a":1,"b":2},"y":{"c":3}}"#;
         assert_eq!(query("*.^", text), r#"["a","b","c"]"#);
+    }
+
+    #[test]
+    fn eval_steps_after_keys_build_one_object() {
+        let text = r#"{"Tim":{"age":53},"Fred":{"age":50,"hobbies":["a","b"]}}"#;
+        assert_eq!(query(".^.age", text), r#"[{"Tim":53,"Fred":50}]"#);
+        assert_eq!(
+            query(".^.{age}", text),
+            r#"[{"Tim":{"age":53},"Fred":{"age":50}}]"#
+        );
+        assert_eq!(
+            query(
+                ".^.hobbies.[]",
+                r#"{"Fred":{"hobbies":["a","b"]},"Ann":{"hobbies":[]}}"#
+            ),
+            r#"[{"Fred":["a","b"],"Ann":[]}]"#
+        );
+        assert_eq!(
+            query(".^.hobbies.[]", r#"{"Fred":{"hobbies":["a"]}}"#),
+            r#"[{"Fred":"a"}]"#
+        );
+    }
+
+    #[test]
+    fn eval_steps_after_keys_build_one_object_per_input() {
+        let text = r#"{"x":{"a":{"n":1},"b":{"n":2}},"y":{"c":{"n":3}}}"#;
+        assert_eq!(query("*.^.n", text), r#"[{"a":1,"b":2},{"c":3}]"#);
+    }
+
+    #[test]
+    fn eval_nested_keys() {
+        let text = r#"{"x":{"a":1,"b":2},"y":{"c":3},"z":{}}"#;
+        assert_eq!(query(".^.^", text), r#"[{"x":["a","b"],"y":"c","z":[]}]"#);
+    }
+
+    #[test]
+    fn execute_steps_after_keys_propagate_errors() {
+        assert_eq!(exec(".^.a", json!({"x": 1})), Err(ExecError::NotAnObject));
+        assert_eq!(exec(".^.a", json!([1])), Err(ExecError::NotAnObject));
     }
 
     #[test]
