@@ -10,7 +10,35 @@
     "name": "bar",
     "age": 29,
     "hobbies": [
-      "bowling"
+      "bowling",
+      "sniveling"
+    ]
+  },
+  "Lorie": {
+    "name": "zoo",
+    "age": 24,
+    "hobbies": [
+    ]
+  },
+  "Teddy": {
+    "name": "quux",
+    "age": 23,
+    "work": {
+      "department": "accounting"
+    },
+    "hobbies": [
+      "sniveling"
+    ]
+  },
+  "Tracy": {
+    "name": "qaz",
+    "age": 13,
+    "work": {
+      "department": "finance"
+    },
+    "hobbies": [
+      "bowling",
+      "sniveling"
     ]
   }
 }

@@ -27,19 +27,26 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
-/// A compiled regex that compares equal to another with the same pattern.
+/// Selects the properties of an object by key: every key (`*`), or the keys a
+/// regex matches (`/regex/`). Compares equal to another with the same regex
+/// source.
 #[derive(Debug)]
-pub struct Pattern(Regex);
+pub struct Pattern(Option<Regex>);
 
 impl Pattern {
-    pub fn is_match(&self, haystack: &str) -> bool {
-        self.0.is_match(haystack)
+    /// Matches every key.
+    pub fn any() -> Self {
+        Self(None)
+    }
+
+    pub fn is_match(&self, key: &str) -> bool {
+        self.0.as_ref().is_none_or(|regex| regex.is_match(key))
     }
 }
 
 impl PartialEq for Pattern {
     fn eq(&self, other: &Self) -> bool {
-        self.0.as_str() == other.0.as_str()
+        self.0.as_ref().map(Regex::as_str) == other.0.as_ref().map(Regex::as_str)
     }
 }
 
@@ -47,15 +54,17 @@ impl PartialEq for Pattern {
 pub enum Op {
     // Object operations
     Property(String),
-    /// A new object holding only the named properties, in the order listed: `{a,b}`.
-    PropertyPick(Vec<String>),
-    PropertyWildcard,
-    PropertyKeys,
-    /// `^` followed by more steps: a new object with the same keys, where each
-    /// value is the result of running the steps on the old value, or an array
-    /// of the results when there are none or several.
-    PropertyMap(Vec<Op>),
-    PropertyRegex(Pattern),
+    /// A new object holding only the listed properties, in the order listed:
+    /// `{a,b}`. Each entry's steps are applied to its property's value.
+    PropertyPick(Vec<PickEntry>),
+    /// The values of the properties whose keys match: `*` or `/regex/`.
+    PropertyValues(Pattern),
+    /// The keys that match: `*^` or `/regex/^`.
+    PropertyKeys(Pattern),
+    /// `*^` or `/regex/^` followed by more steps: a new object with the keys
+    /// that match, where each value is the result of running the steps on the
+    /// old value, shaped as described by `collect` in the exec module.
+    PropertyMap(Pattern, Vec<Op>),
     // Array operations
     Array,
     ArrayIndex(usize),
@@ -65,8 +74,31 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// Whether this op can give several results for one value.
+    pub fn fans_out(&self) -> bool {
+        matches!(
+            self,
+            Self::PropertyValues(_) | Self::PropertyKeys(_) | Self::Array | Self::ArraySlice { .. }
+        )
+    }
+
+    /// Whether this op works on an array.
+    pub fn is_array_step(&self) -> bool {
+        matches!(
+            self,
+            Self::Array | Self::ArrayIndex(_) | Self::ArraySlice { .. }
+        )
+    }
+}
+
+/// One property of a `{...}` pick: its name, and the steps applied to its value.
+/// `hobbies[0]` is `("hobbies", [[0]])`, and `last.name` is `last.{name}`.
+pub type PickEntry = (String, Vec<Op>);
+
+/// Parses a query. An empty query has no steps. A query may not start with
+/// `.`: write `a.b`, not `.a.b`.
 pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
-    let query = query.strip_prefix('.').unwrap_or(query);
     if query.is_empty() {
         return Ok(vec![]);
     }
@@ -77,48 +109,72 @@ pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
     Ok(nest_after_keys(ops))
 }
 
-/// Replaces the first `^` that has steps after it with a [`Op::PropertyMap`]
+/// Replaces the first `*^` or `/regex/^` that has steps after it with a [`Op::PropertyMap`]
 /// holding those steps, and does the same within them.
 fn nest_after_keys(mut ops: Vec<Op>) -> Vec<Op> {
-    if let Some(i) = ops.iter().position(|op| *op == Op::PropertyKeys)
+    if let Some(i) = ops.iter().position(|op| matches!(op, Op::PropertyKeys(_)))
         && i + 1 < ops.len()
     {
         let rest = nest_after_keys(ops.split_off(i + 1));
-        ops[i] = Op::PropertyMap(rest);
+        // After the split, the keys op is the last op.
+        if let Some(Op::PropertyKeys(pattern)) = ops.pop() {
+            ops.push(Op::PropertyMap(pattern, rest));
+        }
     }
     ops
 }
 
-/// Splits a query on `.`, except inside `/regex/` chunks, where `\/` escapes a slash.
+/// Splits a query on `.`, except inside `/regex/` chunks, where `\/` escapes a
+/// slash, and inside `{...}`. A `[` also starts a new chunk, so `a[0]` is two
+/// chunks, but it may not follow a `.`: `a.[0]` is an error.
 fn split_chunks(query: &str) -> Result<Vec<&str>, ParseError> {
     enum State {
         Plain,
         InRegex,
         Escaped,
         RegexClosed,
+        RegexKeys,
     }
 
     let mut chunks = vec![];
     let mut start = 0;
     let mut state = State::Plain;
+    // How many `{` are open.
+    let mut depth = 0usize;
 
     for (i, c) in query.char_indices() {
         state = match (state, c) {
             (State::InRegex, '\\') => State::Escaped,
             (State::InRegex, '/') => State::RegexClosed,
             (State::InRegex | State::Escaped, _) => State::InRegex,
+            (State::Plain, '{') => {
+                depth += 1;
+                State::Plain
+            }
+            (State::Plain, '}') if depth > 0 => {
+                depth -= 1;
+                State::Plain
+            }
+            (State::Plain, _) if depth > 0 => State::Plain,
             (_, '.') => {
                 chunks.push(&query[start..i]);
                 start = i + 1;
                 State::Plain
             }
-            // Nothing may follow a closing `/` except the next `.`.
-            (State::RegexClosed, _) => return Err(ParseError::InvalidQuery),
+            (_, '[') if i == start && i > 0 => return Err(ParseError::InvalidQuery),
+            (_, '[') if i > start => {
+                chunks.push(&query[start..i]);
+                start = i;
+                State::Plain
+            }
+            (State::RegexClosed, '^') => State::RegexKeys,
+            // Nothing may follow a closing `/` except `^` and the next `.` or `[`.
+            (State::RegexClosed | State::RegexKeys, _) => return Err(ParseError::InvalidQuery),
             (State::Plain, '/') if i == start => State::InRegex,
             (State::Plain, _) => State::Plain,
         };
     }
-    if matches!(state, State::InRegex | State::Escaped) {
+    if depth > 0 || matches!(state, State::InRegex | State::Escaped) {
         return Err(ParseError::InvalidQuery);
     }
     chunks.push(&query[start..]);
@@ -126,18 +182,11 @@ fn split_chunks(query: &str) -> Result<Vec<&str>, ParseError> {
 }
 
 fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
-    match chunk {
-        "*" => return Ok(Op::PropertyWildcard),
-        "^" => return Ok(Op::PropertyKeys),
-        "[]" => return Ok(Op::Array),
-        _ => {}
+    if chunk == "[]" {
+        return Ok(Op::Array);
     }
-    if let Some(pattern) = chunk
-        .strip_prefix('/')
-        .and_then(|rest| rest.strip_suffix('/'))
-    {
-        let regex = Regex::new(pattern).map_err(|_| ParseError::InvalidQuery)?;
-        return Ok(Op::PropertyRegex(Pattern(regex)));
+    if let Some(op) = parse_selector(chunk)? {
+        return Ok(op);
     }
     if PROPERTY_REGEX.is_match(chunk) {
         return Ok(Op::Property(chunk.to_owned()));
@@ -146,7 +195,7 @@ fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
     {
-        return parse_property_list(list).map(Op::PropertyPick);
+        return parse_pick_list(list).map(Op::PropertyPick);
     }
     if let Some(caps) = ARRAY_INDEX_REGEX.captures(chunk) {
         let n = caps[1].parse().map_err(|_| ParseError::InvalidQuery)?;
@@ -166,17 +215,110 @@ fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
     Err(ParseError::InvalidQuery)
 }
 
-/// Parses the `a,b` inside `{a,b}`. Names may not repeat, because each
-/// property is moved out of its object and can only be taken once.
-fn parse_property_list(list: &str) -> Result<Vec<String>, ParseError> {
-    let mut names: Vec<String> = vec![];
-    for name in list.split(',') {
-        if !PROPERTY_REGEX.is_match(name) || names.iter().any(|n| n == name) {
-            return Err(ParseError::InvalidQuery);
-        }
-        names.push(name.to_owned());
+/// Parses `*` or `/regex/`, which select properties by key, followed by an
+/// optional `^` to take their keys instead of their values. Returns `None` if
+/// `chunk` is some other kind of step.
+fn parse_selector(chunk: &str) -> Result<Option<Op>, ParseError> {
+    let (selector, keys) = match chunk.strip_suffix('^') {
+        Some(selector) => (selector, true),
+        None => (chunk, false),
+    };
+    let pattern = if selector == "*" {
+        Pattern::any()
+    } else {
+        let Some(source) = selector
+            .strip_prefix('/')
+            .and_then(|rest| rest.strip_suffix('/'))
+        else {
+            return Ok(None);
+        };
+        Pattern(Some(
+            Regex::new(source).map_err(|_| ParseError::InvalidQuery)?,
+        ))
+    };
+    Ok(Some(if keys {
+        Op::PropertyKeys(pattern)
+    } else {
+        Op::PropertyValues(pattern)
+    }))
+}
+
+/// Parses the `a,b.c` inside `{a,b.c}`.
+fn parse_pick_list(list: &str) -> Result<Vec<PickEntry>, ParseError> {
+    let mut entries = vec![];
+    for path in split_top_level_commas(list) {
+        let chunks = split_chunks(path)?;
+        merge_pick_entry(&mut entries, parse_pick_path(&chunks)?)?;
     }
-    Ok(names)
+    Ok(entries)
+}
+
+/// Splits on the commas that are not inside a nested `{...}`.
+fn split_top_level_commas(list: &str) -> Vec<&str> {
+    let mut parts = vec![];
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (i, c) in list.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+    parts
+}
+
+/// Parses one path of a pick, such as `age`, `hobbies[0]` or `last.name`.
+/// It starts with a property name, which may be followed by array steps, and
+/// may end with another property, which is picked in turn, or a `{...}`.
+fn parse_pick_path(chunks: &[&str]) -> Result<PickEntry, ParseError> {
+    let Some((name, mut rest)) = chunks.split_first() else {
+        return Err(ParseError::InvalidQuery);
+    };
+    if !PROPERTY_REGEX.is_match(name) {
+        return Err(ParseError::InvalidQuery);
+    }
+    let mut ops = vec![];
+    while let Some((chunk, after)) = rest.split_first() {
+        if PROPERTY_REGEX.is_match(chunk) {
+            ops.push(Op::PropertyPick(vec![parse_pick_path(rest)?]));
+            break;
+        }
+        match parse_chunk(chunk)? {
+            op @ Op::PropertyPick(_) if after.is_empty() => ops.push(op),
+            op @ (Op::Array | Op::ArrayIndex(_) | Op::ArraySlice { .. }) => ops.push(op),
+            _ => return Err(ParseError::InvalidQuery),
+        }
+        rest = after;
+    }
+    Ok(((*name).to_owned(), ops))
+}
+
+/// Adds `entry` to `entries`. Each property is moved out of its object and can
+/// only be taken once, so a name may only repeat when both entries pick from
+/// it, as in `{a.b,a.c}`, and then the two picks are merged: `{a.{b,c}}`.
+fn merge_pick_entry(
+    entries: &mut Vec<PickEntry>,
+    (name, ops): PickEntry,
+) -> Result<(), ParseError> {
+    let Some((_, existing)) = entries.iter_mut().find(|(n, _)| *n == name) else {
+        entries.push((name, ops));
+        return Ok(());
+    };
+    match (existing.as_mut_slice(), <[Op; 1]>::try_from(ops)) {
+        ([Op::PropertyPick(existing)], Ok([Op::PropertyPick(new)])) => {
+            for entry in new {
+                merge_pick_entry(existing, entry)?;
+            }
+            Ok(())
+        }
+        _ => Err(ParseError::InvalidQuery),
+    }
 }
 
 #[cfg(test)]
@@ -188,38 +330,45 @@ mod tests {
     }
 
     fn re(pattern: &str) -> Op {
-        Op::PropertyRegex(Pattern(Regex::new(pattern).unwrap()))
+        Op::PropertyValues(Pattern(Some(Regex::new(pattern).unwrap())))
     }
 
     #[test]
     fn parse_single_property() {
-        assert_eq!(parse(".Tim"), Ok(vec![prop("Tim")]));
+        assert_eq!(parse("Tim"), Ok(vec![prop("Tim")]));
     }
 
     #[test]
     fn parse_nested_properties() {
-        assert_eq!(parse(".Tim.age"), Ok(vec![prop("Tim"), prop("age")]));
+        assert_eq!(parse("Tim.age"), Ok(vec![prop("Tim"), prop("age")]));
     }
 
     #[test]
     fn parse_wildcard() {
-        assert_eq!(parse(".*"), Ok(vec![Op::PropertyWildcard]));
+        assert_eq!(parse("*"), Ok(vec![Op::PropertyValues(Pattern::any())]));
     }
 
     #[test]
     fn parse_wildcard_then_property() {
-        assert_eq!(parse(".*.age"), Ok(vec![Op::PropertyWildcard, prop("age")]));
+        assert_eq!(
+            parse("*.age"),
+            Ok(vec![Op::PropertyValues(Pattern::any()), prop("age")])
+        );
     }
 
     #[test]
-    fn parse_without_leading_dot() {
-        assert_eq!(parse("Tim.age"), Ok(vec![prop("Tim"), prop("age")]));
+    fn parse_rejects_leading_dot() {
+        for q in [
+            ".", "..", ".Tim", ".Tim.age", ".[0]", ".*", ".*^", "./a/", ".{a}",
+        ] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
     }
 
     #[test]
     fn parse_property_with_underscore_and_hyphen() {
         assert_eq!(
-            parse(".first_name.last-name"),
+            parse("first_name.last-name"),
             Ok(vec![prop("first_name"), prop("last-name")])
         );
     }
@@ -227,12 +376,29 @@ mod tests {
     #[test]
     fn parse_empty_query_yields_no_ops() {
         assert_eq!(parse(""), Ok(vec![]));
-        assert_eq!(parse("."), Ok(vec![]));
     }
 
     #[test]
     fn parse_chunk_wildcard() {
-        assert_eq!(parse_chunk("*"), Ok(Op::PropertyWildcard));
+        assert_eq!(parse_chunk("*"), Ok(Op::PropertyValues(Pattern::any())));
+    }
+
+    #[test]
+    fn parse_selectors() {
+        let regex = |s| Pattern(Some(Regex::new(s).unwrap()));
+        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::any())]));
+        assert_eq!(parse("/a/"), Ok(vec![Op::PropertyValues(regex("a"))]));
+        assert_eq!(parse("/a/^"), Ok(vec![Op::PropertyKeys(regex("a"))]));
+        assert_eq!(parse("/a^/"), Ok(vec![Op::PropertyValues(regex("a^"))]));
+        assert_eq!(parse("//^"), Ok(vec![Op::PropertyKeys(regex(""))]));
+    }
+
+    #[test]
+    fn pattern_any_matches_every_key() {
+        for key in ["", "a", "é", "a.b"] {
+            assert!(Pattern::any().is_match(key), "key {key:?}");
+        }
+        assert_ne!(Pattern::any(), Pattern(Some(Regex::new("").unwrap())));
     }
 
     #[test]
@@ -249,8 +415,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_invalid_chunk() {
-        assert!(parse(".foo.$$.bar").is_err());
-        assert!(parse(".foo..bar").is_err());
+        assert!(parse("foo.$$.bar").is_err());
+        assert!(parse("foo..bar").is_err());
     }
 
     #[test]
@@ -280,9 +446,9 @@ mod tests {
 
     #[test]
     fn parse_regex() {
-        assert_eq!(parse("./^a/"), Ok(vec![re("^a")]));
+        assert_eq!(parse("/^a/"), Ok(vec![re("^a")]));
         assert_eq!(parse("/^a/.b"), Ok(vec![re("^a"), prop("b")]));
-        assert_eq!(parse(".x.//"), Ok(vec![prop("x"), re("")]));
+        assert_eq!(parse("x.//"), Ok(vec![prop("x"), re("")]));
     }
 
     #[test]
@@ -320,6 +486,37 @@ mod tests {
     }
 
     #[test]
+    fn split_chunks_on_brackets() {
+        assert_eq!(split_chunks("a[0]"), Ok(vec!["a", "[0]"]));
+        assert_eq!(
+            split_chunks("a[0][1:].b"),
+            Ok(vec!["a", "[0]", "[1:]", "b"])
+        );
+        assert_eq!(split_chunks("[][0]"), Ok(vec!["[]", "[0]"]));
+        assert_eq!(split_chunks("/a/[0]"), Ok(vec!["/a/", "[0]"]));
+        assert_eq!(split_chunks("/a/^[0]"), Ok(vec!["/a/^", "[0]"]));
+        // Inside a regex, `[` is a character class.
+        assert_eq!(split_chunks("/[ab]/"), Ok(vec!["/[ab]/"]));
+    }
+
+    #[test]
+    fn parse_array_steps_without_dot() {
+        assert_eq!(parse("a[0]"), Ok(vec![prop("a"), Op::ArrayIndex(0)]));
+        assert_eq!(parse("a[].b"), Ok(vec![prop("a"), Op::Array, prop("b")]));
+        assert_eq!(parse("[0]"), Ok(vec![Op::ArrayIndex(0)]));
+        for q in ["a[", "a[0", "a[0]b", "a[x]", "a..[0]"] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
+    fn split_chunks_rejects_dot_before_bracket() {
+        for q in ["a.[0]", "a.[]", "a[0].[1]", "/a/.[0]", "*^.[0]"] {
+            assert!(split_chunks(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
     fn split_chunks_handles_non_ascii() {
         assert_eq!(split_chunks("/é.ü/.ñ"), Ok(vec!["/é.ü/", "ñ"]));
     }
@@ -336,7 +533,7 @@ mod tests {
         assert_eq!(parse("[]"), Ok(vec![Op::Array]));
         assert_eq!(parse("[0]"), Ok(vec![Op::ArrayIndex(0)]));
         assert_eq!(
-            parse(".a.[12].b"),
+            parse("a[12].b"),
             Ok(vec![prop("a"), Op::ArrayIndex(12), prop("b")])
         );
     }
@@ -357,7 +554,7 @@ mod tests {
 
     #[test]
     fn pattern_equality_compares_source() {
-        let p = |s| Pattern(Regex::new(s).unwrap());
+        let p = |s| Pattern(Some(Regex::new(s).unwrap()));
         assert_eq!(p("^a+$"), p("^a+$"));
         assert_ne!(p("a"), p("b"));
         // Equivalent regexes with different source are not equal.
@@ -366,14 +563,121 @@ mod tests {
 
     #[test]
     fn parse_pick() {
-        let props =
-            |names: &[&str]| Op::PropertyPick(names.iter().map(|n| n.to_string()).collect());
-        assert_eq!(parse(".a.{b,c}"), Ok(vec![prop("a"), props(&["b", "c"])]));
+        let props = |names: &[&str]| {
+            Op::PropertyPick(names.iter().map(|n| (n.to_string(), vec![])).collect())
+        };
+        assert_eq!(parse("a.{b,c}"), Ok(vec![prop("a"), props(&["b", "c"])]));
         assert_eq!(parse("{b}"), Ok(vec![props(&["b"])]));
         assert_eq!(
             parse("{first_name,last-name}.x"),
             Ok(vec![props(&["first_name", "last-name"]), prop("x")])
         );
+    }
+
+    fn pick(entries: Vec<(&str, Vec<Op>)>) -> Op {
+        Op::PropertyPick(
+            entries
+                .into_iter()
+                .map(|(n, ops)| (n.to_string(), ops))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parse_pick_paths() {
+        assert_eq!(
+            parse("{age,hobbies[0]}"),
+            Ok(vec![pick(vec![
+                ("age", vec![]),
+                ("hobbies", vec![Op::ArrayIndex(0)])
+            ])])
+        );
+        assert_eq!(
+            parse("a.{age,last.name}.b"),
+            Ok(vec![
+                prop("a"),
+                pick(vec![
+                    ("age", vec![]),
+                    ("last", vec![pick(vec![("name", vec![])])])
+                ]),
+                prop("b")
+            ])
+        );
+        assert_eq!(
+            parse("{f[0].n[]}"),
+            Ok(vec![pick(vec![(
+                "f",
+                vec![Op::ArrayIndex(0), pick(vec![("n", vec![Op::Array])])]
+            )])])
+        );
+    }
+
+    #[test]
+    fn parse_pick_paths_ending_in_braces() {
+        assert_eq!(parse("{a.{b,c}}"), parse("{a.b,a.c}"));
+        assert_eq!(
+            parse("{a[1:].{b}}"),
+            Ok(vec![pick(vec![(
+                "a",
+                vec![
+                    Op::ArraySlice {
+                        start: Some(1),
+                        stop: None
+                    },
+                    pick(vec![("b", vec![])])
+                ]
+            )])])
+        );
+    }
+
+    #[test]
+    fn parse_pick_merges_shared_paths() {
+        let expected = Ok(vec![pick(vec![
+            (
+                "a",
+                vec![pick(vec![
+                    ("b", vec![]),
+                    ("c", vec![pick(vec![("d", vec![]), ("e", vec![])])]),
+                ])],
+            ),
+            ("x", vec![]),
+        ])]);
+        assert_eq!(parse("{a.b,a.c.d,x,a.c.e}"), expected);
+        assert_eq!(parse("{a.{b,c.d},x,a.c.{e}}"), expected);
+    }
+
+    #[test]
+    fn parse_pick_rejects_invalid_paths() {
+        for q in [
+            "{a.b,a}",
+            "{a,a.b}",
+            "{a.b,a.b}",
+            "{a[0],a[1]}",
+            "{a[0],a.b}",
+            "{[0]}",
+            "{a.[0]}",
+            "{a.*}",
+            "{a.^}",
+            "{a./b/}",
+            "{a.{b}.c}",
+            "{a.{b}[0]}",
+            "{a..b}",
+            "{a.}",
+            "{.a}",
+            "{a.{b}",
+            "{a}}",
+        ] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
+    fn split_chunks_keeps_braces_whole() {
+        assert_eq!(
+            split_chunks("a.{b.c,d[0]}.e"),
+            Ok(vec!["a", "{b.c,d[0]}", "e"])
+        );
+        assert_eq!(split_chunks("{a.{b.c}}[0]"), Ok(vec!["{a.{b.c}}", "[0]"]));
     }
 
     #[test]
@@ -387,20 +691,28 @@ mod tests {
 
     #[test]
     fn parse_keys() {
-        assert_eq!(parse(".^"), Ok(vec![Op::PropertyKeys]));
-        assert_eq!(parse("^"), Ok(vec![Op::PropertyKeys]));
-        assert_eq!(parse(".a.^"), Ok(vec![prop("a"), Op::PropertyKeys]));
-        assert!(parse(".^^").is_err());
+        assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::any())]));
+        for q in ["^", "a.^", "^.a", "*.^", "**^", "*^^", "^*"] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+        assert_eq!(
+            parse("a.*^"),
+            Ok(vec![prop("a"), Op::PropertyKeys(Pattern::any())])
+        );
+        assert!(parse("^^").is_err());
     }
 
     #[test]
     fn parse_steps_after_keys_nest_in_a_property_map() {
-        assert_eq!(parse(".^.a"), Ok(vec![Op::PropertyMap(vec![prop("a")])]));
         assert_eq!(
-            parse("*.^.a.[]"),
+            parse("*^.a"),
+            Ok(vec![Op::PropertyMap(Pattern::any(), vec![prop("a")])])
+        );
+        assert_eq!(
+            parse("*.*^.a[]"),
             Ok(vec![
-                Op::PropertyWildcard,
-                Op::PropertyMap(vec![prop("a"), Op::Array])
+                Op::PropertyValues(Pattern::any()),
+                Op::PropertyMap(Pattern::any(), vec![prop("a"), Op::Array])
             ])
         );
     }
@@ -408,16 +720,40 @@ mod tests {
     #[test]
     fn parse_nested_keys() {
         assert_eq!(
-            parse(".^.^"),
-            Ok(vec![Op::PropertyMap(vec![Op::PropertyKeys])])
+            parse("*^.*^"),
+            Ok(vec![Op::PropertyMap(
+                Pattern::any(),
+                vec![Op::PropertyKeys(Pattern::any())]
+            )])
         );
         assert_eq!(
-            parse("^.a.^.b"),
-            Ok(vec![Op::PropertyMap(vec![
-                prop("a"),
-                Op::PropertyMap(vec![prop("b")])
-            ])])
+            parse("*^.a.*^.b"),
+            Ok(vec![Op::PropertyMap(
+                Pattern::any(),
+                vec![prop("a"), Op::PropertyMap(Pattern::any(), vec![prop("b")])]
+            )])
         );
+    }
+
+    #[test]
+    fn parse_regex_keys() {
+        let keys = |pattern: &str| Op::PropertyKeys(Pattern(Some(Regex::new(pattern).unwrap())));
+        assert_eq!(parse("/T.*/^"), Ok(vec![keys("T.*")]));
+        assert_eq!(parse("a./x\\//^"), Ok(vec![prop("a"), keys(r"x\/")]));
+        assert_eq!(
+            parse("/T.*/^.name"),
+            Ok(vec![Op::PropertyMap(
+                Pattern(Some(Regex::new("T.*").unwrap())),
+                vec![prop("name")]
+            )])
+        );
+    }
+
+    #[test]
+    fn parse_regex_keys_rejects_invalid() {
+        for q in ["/a/^^", "/a/^b", "/a/^/", "/(/^", "/^", "a^"] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
     }
 
     #[test]

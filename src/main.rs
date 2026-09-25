@@ -1,7 +1,7 @@
 mod exec;
 mod parser;
 
-use exec::execute;
+use exec::{collect, execute};
 use parser::{Op, parse};
 use serde_json::Value;
 use std::error::Error;
@@ -35,17 +35,14 @@ fn run(query: &str, path: Option<&str>) -> Result<(), Box<dyn Error>> {
         None => io::read_to_string(io::stdin())?,
     };
     let out = eval(&ops, text)?;
-    println!("{}", render(&ops, &out)?);
+    println!("{}", render(&ops, out)?);
     Ok(())
 }
 
-/// Pretty-prints query results as a JSON array, except that a query with no
-/// steps prints the input unchanged.
-fn render(ops: &[Op], out: &[Value]) -> serde_json::Result<String> {
-    match (ops, out) {
-        ([], [input]) => serde_json::to_string_pretty(input),
-        _ => serde_json::to_string_pretty(out),
-    }
+/// Pretty-prints query results: a single result as it is, and none or
+/// several as a JSON array, except that a query with a slice always gives an array.
+fn render(ops: &[Op], out: Vec<Value>) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(&collect(ops, out))
 }
 
 fn eval(ops: &[Op], text: String) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -67,7 +64,7 @@ mod tests {
     #[test]
     fn run_rejects_invalid_query() {
         // The query is parsed before the file is read, so a bad query wins.
-        let err = run(".foo.$$", Some("no/such/file.json")).unwrap_err();
+        let err = run("foo.$$", Some("no/such/file.json")).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ParseError>(),
             Some(&ParseError::InvalidQuery)
@@ -76,7 +73,7 @@ mod tests {
 
     #[test]
     fn run_rejects_missing_file() {
-        let err = run(".a", Some("no/such/file.json")).unwrap_err();
+        let err = run("a", Some("no/such/file.json")).unwrap_err();
         assert!(err.downcast_ref::<std::io::Error>().is_some());
     }
 
@@ -84,14 +81,14 @@ mod tests {
     fn run_reads_named_file() {
         let path = std::env::temp_dir().join(format!("jt-test-{}.json", std::process::id()));
         std::fs::write(&path, r#"{"a":1}"#).unwrap();
-        let result = run(".a", path.to_str());
+        let result = run("a", path.to_str());
         std::fs::remove_file(&path).unwrap();
         assert!(result.is_ok());
     }
 
     #[test]
     fn eval_empty_query_returns_input() {
-        assert_eq!(query(".", r#"{"a":1}"#), r#"[{"a":1}]"#);
+        assert_eq!(query("", r#"{"a":1}"#), r#"[{"a":1}]"#);
     }
 
     #[test]
@@ -101,29 +98,32 @@ mod tests {
 
     fn render_query(q: &str, text: &str) -> String {
         let ops = parse(q).unwrap();
-        render(&ops, &eval(&ops, text.to_owned()).unwrap()).unwrap()
+        render(&ops, eval(&ops, text.to_owned()).unwrap()).unwrap()
     }
 
     #[test]
     fn render_empty_query_prints_input_unwrapped() {
-        for q in ["", "."] {
-            assert_eq!(
-                render_query(q, r#"{"a":1}"#),
-                "{\n  \"a\": 1\n}",
-                "query {q:?}"
-            );
-            assert_eq!(render_query(q, "[1,2]"), "[\n  1,\n  2\n]", "query {q:?}");
-            assert_eq!(render_query(q, "7"), "7", "query {q:?}");
-        }
+        assert_eq!(render_query("", r#"{"a":1}"#), "{\n  \"a\": 1\n}");
+        assert_eq!(render_query("", "[1,2]"), "[\n  1,\n  2\n]");
+        assert_eq!(render_query("", "7"), "7");
     }
 
     #[test]
-    fn render_query_with_steps_is_always_an_array() {
-        assert_eq!(render_query(".a", r#"{"a":1}"#), "[\n  1\n]");
-        assert_eq!(
-            render_query(".a", r#"{"a":{"b":2}}"#),
-            "[\n  {\n    \"b\": 2\n  }\n]"
-        );
+    fn render_single_result_unwrapped() {
+        assert_eq!(render_query("a", r#"{"a":1}"#), "1");
+        assert_eq!(render_query("a", r#"{"a":{"b":2}}"#), "{\n  \"b\": 2\n}");
+        assert_eq!(render_query("a", r#"{"a":[1]}"#), "[\n  1\n]");
+    }
+
+    #[test]
+    fn render_slice_as_array_even_with_one_result() {
+        assert_eq!(render_query("*", r#"{"a":1}"#), "1");
+        assert_eq!(render_query("[0:1]", "[1,2]"), "[\n  1\n]");
+    }
+
+    #[test]
+    fn render_none_or_several_results_as_array() {
         assert_eq!(render_query("*", "{}"), "[]");
+        assert_eq!(render_query("*", r#"{"a":1,"b":2}"#), "[\n  1,\n  2\n]");
     }
 }
