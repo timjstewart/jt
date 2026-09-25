@@ -24,6 +24,8 @@ jt 'Tim.age' people.json
 cat people.json | jt 'Tim.age'
 ```
 
+Output is colored, except when it is piped or redirected.
+
 Always quote the query. Characters like `*`, `[` and `$` mean something to the shell.
 
 ## Building

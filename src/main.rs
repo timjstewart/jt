@@ -1,11 +1,12 @@
 mod exec;
 mod parser;
 
+use colored_json::ColorMode;
 use exec::{collect, execute};
 use parser::{Op, parse};
 use serde_json::Value;
 use std::error::Error;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -35,14 +36,20 @@ fn run(query: &str, path: Option<&str>) -> Result<(), Box<dyn Error>> {
         None => io::read_to_string(io::stdin())?,
     };
     let out = eval(&ops, text)?;
-    println!("{}", render(&ops, out)?);
+    // Color the output unless it is redirected.
+    let color = if io::stdout().is_terminal() {
+        ColorMode::On
+    } else {
+        ColorMode::Off
+    };
+    println!("{}", render(&ops, out, color)?);
     Ok(())
 }
 
 /// Pretty-prints query results: a single result as it is, and none or
 /// several as a JSON array, except that a query with a slice always gives an array.
-fn render(ops: &[Op], out: Vec<Value>) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(&collect(ops, out))
+fn render(ops: &[Op], out: Vec<Value>, color: ColorMode) -> serde_json::Result<String> {
+    colored_json::to_colored_json(&collect(ops, out), color)
 }
 
 fn eval(ops: &[Op], text: String) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -98,7 +105,18 @@ mod tests {
 
     fn render_query(q: &str, text: &str) -> String {
         let ops = parse(q).unwrap();
-        render(&ops, eval(&ops, text.to_owned()).unwrap()).unwrap()
+        render(&ops, eval(&ops, text.to_owned()).unwrap(), ColorMode::Off).unwrap()
+    }
+
+    #[test]
+    fn render_colors_only_when_asked() {
+        let ops = parse("").unwrap();
+        let out = || vec![serde_json::json!({"a": [1, "s", null, true]})];
+        let plain = render(&ops, out(), ColorMode::Off).unwrap();
+        let colored = render(&ops, out(), ColorMode::On).unwrap();
+        assert!(!plain.contains('\x1b'));
+        assert!(colored.contains('\x1b'));
+        assert_ne!(plain, colored);
     }
 
     #[test]
