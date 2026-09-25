@@ -15,12 +15,13 @@ fn get_property_regex() -> &'static Regex {
 #[derive(Debug, PartialEq)]
 enum ParseError {
     Unknown,
+    NotAnObject,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ParseError::Unknown => write!(f, "unknown parse error"),
+            _ => write!(f, "unknown parse error"),
         }
     }
 }
@@ -59,7 +60,7 @@ fn parse_chunk(chunk: &str) -> Result<Vec<Op>, ParseError> {
 fn main() -> ExitCode {
     match run() {
         Ok(_) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
@@ -78,8 +79,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn execute<'a>(ops: &Vec<Op>, json: &'a Value) -> Result<&'a Value, ParseError> {
-    Ok(json)
+fn execute(ops: &Vec<Op>, json: &Value) -> Result<Value, ParseError> {
+    let result: Option<serde_json::Value> = None;
+
+    for op in ops {
+        match op {
+            Op::Property(name) => match json {
+                Value::Object(obj) => {
+                    if obj.contains_key(name) {
+                    } else {
+                    }
+                }
+                _ => return Err(ParseError::NotAnObject),
+            },
+            Op::PropertyWildCard => {}
+        }
+    }
+
+    match result {
+        Some(json) => Ok(json),
+        None => Err(ParseError::Unknown),
+    }
 }
 
 #[cfg(test)]
