@@ -34,7 +34,7 @@ fn run(query: &str, path: Option<&str>) -> Result<(), Box<dyn Error>> {
         Some(path) => std::fs::read_to_string(path)?,
         None => io::read_to_string(io::stdin())?,
     };
-    let out = eval(&ops, &text)?;
+    let out = eval(&ops, text)?;
     println!("{}", render(&ops, &out)?);
     Ok(())
 }
@@ -48,8 +48,10 @@ fn render(ops: &[Op], out: &[Value]) -> serde_json::Result<String> {
     }
 }
 
-fn eval(ops: &[Op], text: &str) -> Result<Vec<Value>, Box<dyn Error>> {
-    let json: Value = serde_json::from_str(text)?;
+fn eval(ops: &[Op], text: String) -> Result<Vec<Value>, Box<dyn Error>> {
+    let json: Value = serde_json::from_str(&text)?;
+    // The parsed document replaces the text, so free the text before running.
+    drop(text);
     Ok(execute(ops, vec![json])?)
 }
 
@@ -59,7 +61,7 @@ mod tests {
     use parser::ParseError;
 
     fn query(q: &str, text: &str) -> String {
-        serde_json::to_string(&eval(&parse(q).unwrap(), text).unwrap()).unwrap()
+        serde_json::to_string(&eval(&parse(q).unwrap(), text.to_owned()).unwrap()).unwrap()
     }
 
     #[test]
@@ -94,7 +96,7 @@ mod tests {
 
     #[test]
     fn eval_rejects_invalid_json() {
-        assert!(eval(&[], "{not json").is_err());
+        assert!(eval(&[], "{not json".to_owned()).is_err());
     }
 
     #[test]
@@ -108,7 +110,7 @@ mod tests {
 
     fn render_query(q: &str, text: &str) -> String {
         let ops = parse(q).unwrap();
-        render(&ops, &eval(&ops, text).unwrap()).unwrap()
+        render(&ops, &eval(&ops, text.to_owned()).unwrap()).unwrap()
     }
 
     #[test]

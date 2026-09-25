@@ -28,7 +28,7 @@ impl Error for ExecError {}
 pub fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ExecError> {
     ops.iter().try_fold(input, |nodes, op| {
         let mut out = vec![];
-        for node in &nodes {
+        for node in nodes {
             apply(op, node, &mut out)?;
         }
         Ok(out)
@@ -36,27 +36,34 @@ pub fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ExecError> {
 }
 
 /// Applies a single op to a single value, appending the results to `out`.
-fn apply(op: &Op, node: &Value, out: &mut Vec<Value>) -> Result<(), ExecError> {
+///
+/// Takes `node` by value so that selected parts are moved out rather than
+/// cloned; each value is used by exactly one step, and whatever isn't selected
+/// is dropped here.
+fn apply(op: &Op, node: Value, out: &mut Vec<Value>) -> Result<(), ExecError> {
     match (op, node) {
-        (Op::Property(name), Value::Object(obj)) => {
-            out.push(obj.get(name).cloned().unwrap_or_default());
+        (Op::Property(name), Value::Object(mut obj)) => {
+            out.push(obj.remove(name).unwrap_or_default());
         }
-        (Op::PropertyWildcard, Value::Object(obj)) => out.extend(obj.values().cloned()),
+        (Op::PropertyWildcard, Value::Object(obj)) => out.extend(obj.into_values()),
         (Op::PropertyKeys, Value::Object(obj)) => {
-            out.extend(obj.keys().cloned().map(Value::String));
+            out.extend(obj.into_iter().map(|(key, _)| Value::String(key)));
         }
         (Op::PropertyRegex(pattern), Value::Object(obj)) => out.extend(
-            obj.iter()
+            obj.into_iter()
                 .filter(|(key, _)| pattern.is_match(key))
-                .map(|(_, value)| value.clone()),
+                .map(|(_, value)| value),
         ),
-        (Op::Array, Value::Array(array)) => out.extend(array.iter().cloned()),
+        (Op::Array, Value::Array(array)) => out.extend(array),
         (Op::ArrayIndex(n), Value::Array(array)) => {
-            out.push(array.get(*n).cloned().unwrap_or_default());
+            out.push(array.into_iter().nth(*n).unwrap_or_default());
         }
-        (Op::ArraySlice { start, stop }, Value::Array(array)) => {
+        (Op::ArraySlice { start, stop }, Value::Array(mut array)) => {
+            // Trim the array in place, reusing its allocation.
             let range = slice_range(array.len(), *start, *stop);
-            out.push(Value::Array(array[range].to_vec()));
+            array.truncate(range.end);
+            array.drain(..range.start);
+            out.push(Value::Array(array));
         }
         // Looking up a single element of null yields null, as in jq.
         (Op::Property(_) | Op::ArrayIndex(_) | Op::ArraySlice { .. }, Value::Null) => {
