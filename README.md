@@ -58,12 +58,13 @@ A query is a list of steps separated by `.`. The leading `.` is optional, so `.T
 |---|---|---|
 | `name` | object | the value of property `name` |
 | `*` | object | every property value |
+| `^` | object | every property key |
 | `/regex/` | object | every property value whose key matches `regex` |
 | `[]` | array | every element |
 | `[n]` | array | the element at index `n` |
 | `[start:stop]` | array | a sub-array, like a Python slice |
 
-An empty query (`.` or `''`) returns the input unchanged.
+An empty query (`.` or `''`) prints the input unchanged, without wrapping it in an array. It works as a JSON pretty-printer: `jt . data.json`.
 
 ### Properties: `name`
 
@@ -87,6 +88,18 @@ Property names may contain only letters, `_` and `-`. To reach a key with other 
 | `*.age` | `[53,50,null,null]` |
 
 Values come back in the order they appear in the document.
+
+### All keys: `^`
+
+| Query | Output |
+|---|---|
+| `.^` | `["Tim","Fred","user_1","user_2"]` |
+| `.Fred.^` | `["age","hobbies"]` |
+| `*.^` | `["age","age","hobbies","name","name"]` |
+
+Keys come back as strings, in document order. As with `*`, each key is a separate result, so `*.^` gives the keys of every object in one list, repeats included.
+
+`^` must be the last step. Keys are strings, and no step applies to a string, so a query like `.^.x` is rejected before any input is read.
 
 ### Properties matching a regex: `/regex/`
 
@@ -140,10 +153,11 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 | Message | Cause | Example |
 |---|---|---|
 | `invalid query` | the query doesn't parse | `.Tim..age`, `.Tim.[-1]`, `/(/` |
+| `` `^` must be the last step `` | a step after `^` | `.^.x`, `.Fred.^.[0]` |
 | `not an object` | a property step on something that isn't an object | `.Tim.age.x`, `.Fred.hobbies.age` |
 | `not an array` | an array step on something that isn't an array | `.Tim.[]` |
 | file or JSON errors | the file is missing, or the input isn't valid JSON | |
 
 On `null`:
-- `*`, `/regex/` and `[]` are errors.
+- `*`, `^`, `/regex/` and `[]` are errors.
 - `name`, `[n]` and `[start:stop]` return `null`.
