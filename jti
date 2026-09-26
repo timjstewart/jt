@@ -16,6 +16,11 @@ if [[ ! -r $file ]]; then
     exit 1
 fi
 
+if ! command -v fzf >/dev/null; then
+    echo "jti: fzf not found; install it and put it on PATH" >&2
+    exit 1
+fi
+
 # Use jt from PATH, or the release build next to this script.
 if command -v jt >/dev/null; then
     jt=$(command -v jt)
