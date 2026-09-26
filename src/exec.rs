@@ -30,6 +30,8 @@ impl Error for ExecError {}
 /// `null` results, and a property that holds an array adds its elements
 /// instead, unless the next step is an array step. So `*.hobbies` gives every
 /// hobby, like `*.hobbies[]`, while `*.hobbies[0]` gives each first hobby.
+/// Steps after `*^`, `name^` or `/regex/^` also leave out the empty objects
+/// they build from objects with no matching keys.
 pub fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ExecError> {
     let mut nodes = input;
     let mut fanned_out = false;
@@ -45,6 +47,9 @@ pub fn execute(ops: &[Op], input: Vec<Value>) -> Result<Vec<Value>, ExecError> {
                 out = out.into_iter().flat_map(elements_or_self).collect();
             }
             out.retain(|value| !value.is_null());
+            if matches!(op, Op::PropertyMap(..)) {
+                out.retain(|value| value.as_object().is_none_or(|obj| !obj.is_empty()));
+            }
         }
         fanned_out |= op.fans_out();
         nodes = out;
@@ -132,17 +137,22 @@ pub fn collect(ops: &[Op], mut values: Vec<Value>) -> Value {
     }
 }
 
-/// Builds an object holding only the properties of `obj` named in `entries`,
-/// in that order, with `null` for any that are missing. Each property's value
-/// is the result of running the entry's steps on it.
+/// Builds an object holding one property for each of `entries`, in that
+/// order: the result of running the entry's steps on the value of its
+/// property in `obj`, or on `null` if it is missing. A value is moved out of
+/// `obj` by the last entry that reads it, and cloned for the others.
 fn pick(entries: &[PickEntry], mut obj: Map<String, Value>) -> Result<Value, ExecError> {
     entries
         .iter()
-        .map(|(name, ops)| {
-            let (key, value) = obj
-                .remove_entry(name)
-                .unwrap_or_else(|| (name.clone(), Value::Null));
-            Ok((key, collect(ops, execute(ops, vec![value])?)))
+        .enumerate()
+        .map(|(i, PickEntry { key, name, steps })| {
+            let value = if entries[i + 1..].iter().any(|e| e.name == *name) {
+                obj.get(name).cloned()
+            } else {
+                obj.remove(name)
+            };
+            let values = execute(steps, vec![value.unwrap_or_default()])?;
+            Ok((key.clone(), collect(steps, values)))
         })
         .collect()
 }
@@ -337,27 +347,27 @@ mod tests {
     }
 
     #[test]
-    fn eval_pick_paths_keep_structure() {
+    fn eval_pick_paths_are_keyed_by_last_name() {
         let text = r#"{"age":50,"hobbies":["bridge","chess"],"last":{"name":"Smith","x":1},"y":2}"#;
         assert_eq!(
             query("{age,hobbies[0],last.name}", text),
-            r#"[{"age":50,"hobbies":"bridge","last":{"name":"Smith"}}]"#
+            r#"[{"age":50,"hobbies":"bridge","name":"Smith"}]"#
         );
         assert_eq!(
             query("{hobbies[1:],last.{x,name}}", text),
-            r#"[{"hobbies":["chess"],"last":{"x":1,"name":"Smith"}}]"#
+            r#"[{"hobbies":["chess"],"x":1,"name":"Smith"}]"#
         );
         assert_eq!(
-            query("{last.name,age,last.x}", text),
-            r#"[{"last":{"name":"Smith","x":1},"age":50}]"#
+            query("{last.name,age,last.x,last}", text),
+            r#"[{"name":"Smith","age":50,"x":1,"last":{"name":"Smith","x":1}}]"#
         );
     }
 
     #[test]
     fn eval_pick_paths_through_arrays() {
         let text = r#"{"f":[{"n":"a","m":1},{"n":"b"}]}"#;
-        assert_eq!(query("{f[].n}", text), r#"[{"f":[{"n":"a"},{"n":"b"}]}]"#);
-        assert_eq!(query("{f[0].{n,m}}", text), r#"[{"f":{"n":"a","m":1}}]"#);
+        assert_eq!(query("{f[].n}", text), r#"[{"n":["a","b"]}]"#);
+        assert_eq!(query("{f[0].{n,m}}", text), r#"[{"n":"a","m":1}]"#);
     }
 
     #[test]
@@ -365,7 +375,7 @@ mod tests {
         let text = r#"{"age":8}"#;
         assert_eq!(
             query("{hobbies[0],last.name}", text),
-            r#"[{"hobbies":null,"last":{"name":null}}]"#
+            r#"[{"hobbies":null,"name":null}]"#
         );
         assert_eq!(
             exec("{age[0]}", json!({"age": 8})),
@@ -456,6 +466,17 @@ mod tests {
     fn execute_applies_op_to_every_node() {
         let input = json!([{"n": 1}, {"n": 2}, {"n": 3}]);
         assert_eq!(exec("[].n", input), Ok(vec![json!(1), json!(2), json!(3)]));
+    }
+
+    #[test]
+    fn eval_property_map_after_fan_out_drops_empty_objects() {
+        let text = r#"[{"a":{"name":"foo"}},{"b":{"name":"bar"}},{"b":{}}]"#;
+        assert_eq!(query("[]./b/^.name", text), r#"[{"b":"bar"},{"b":null}]"#);
+        assert_eq!(query("[]./x/^.name", text), "[]");
+        // Empty objects in the data are kept.
+        assert_eq!(query("[].b", text), r#"[{"name":"bar"},{}]"#);
+        // Before a fan-out, the one object is kept even when empty.
+        assert_eq!(query("/x/^.name", r#"{"a":1}"#), "[{}]");
     }
 
     #[test]

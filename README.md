@@ -3,7 +3,7 @@
 A small command-line tool for pulling values out of JSON, in the spirit of `jq`.
 
 ```sh
-jt <query> [file]
+jt [-C|--color] [--keep-nulls] <query> [file]
 ```
 
 `jt` reads JSON from `file`, or from stdin if no file is given, runs the query, and pretty-prints the result. A query that gives one result prints it on its own. A query that gives several, or none, prints them as a JSON array. A query with a slice (`[start:stop]`) always prints an array:
@@ -24,7 +24,11 @@ jt 'Tim.age' people.json
 cat people.json | jt 'Tim.age'
 ```
 
-Output is colored, except when it is piped or redirected.
+Output is colored, except when it is piped or redirected. Pass `-C` (or `--color`) to force color anyway, e.g. `jt -C Tim people.json | less -R`.
+
+Keys whose values are `null` are left out of the output, at any depth, so `{"a":1,"b":null}` prints as `{"a":1}`. Pass `--keep-nulls` to keep them. Nulls in arrays, and a result that is itself `null`, are always printed. The examples below show output without `--keep-nulls`.
+
+`jt --help` lists the options.
 
 Always quote the query. Characters like `*`, `[` and `$` mean something to the shell.
 
@@ -92,23 +96,23 @@ Property names may contain only letters, `_` and `-`. To reach a key with other 
 | Query | Output |
 |---|---|
 | `Fred.{age,hobbies}` | `{"age":50,"hobbies":["bridge","yodelling","chess"]}` |
-| `*.{age}` | `[{"age":53},{"age":50},{"age":null},{"age":null}]` |
+| `*.{age}` | `[{"age":53},{"age":50},{},{}]` |
 | `{Tim,Fred}.Tim` | `{"age":53}` |
 | `Fred.{age,hobbies[0]}` | `{"age":50,"hobbies":"bridge"}` |
 | `Fred.{hobbies[1:]}` | `{"hobbies":["yodelling","chess"]}` |
-| `{Tim.age,Fred.age}` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
-| `{Fred.{age,hobbies[0]},Tim.age}` | `{"Fred":{"age":50,"hobbies":"bridge"},"Tim":{"age":53}}` |
+| `{Tim.age,Fred.hobbies}` | `{"age":53,"hobbies":["bridge","yodelling","chess"]}` |
+| `{Fred.{age,hobbies[0]}}` | `{"age":50,"hobbies":"bridge"}` |
 
 - Builds a new object holding only the listed properties, in the order listed.
-- A missing property is included with the value `null`. On `null`, every listed property is `null`.
+- A missing property gets the value `null`, so it is left out unless `--keep-nulls` is passed. On `null`, every listed property is `null`.
 - Names follow the same rules as `name`. Don't put spaces after the commas.
 
-Each entry in the list can be a path instead of a single name. The result keeps the structure of the input, trimmed down to the parts you picked:
+Each entry in the list can be a path instead of a single name. The key is the last name in the path, and the value is what the path gives, so `{name,work.department}` gives `{"name":...,"department":...}`:
 
-- A path starts with a property name, which becomes the key.
-- Array steps may follow the name: `hobbies[0]`, `hobbies[]`, `hobbies[1:]`. The key holds their result, shaped as described at the top: one result as it is, several in an array, and a slice always in an array.
-- A path may continue with `.` and another path, which is picked from the value in turn, so `last.name` is the same as `last.{name}`. It may also end with a `{...}` of its own.
-- Paths that start with the same name are merged, so `{last.first,last.name}` is `{last.{first,name}}`. Otherwise a name can't be listed twice: `{age,age}`, `{last,last.name}` and `{hobbies[0],hobbies[1]}` are invalid.
+- A path starts with a property name. Array steps may follow any name: `hobbies[0]`, `hobbies[]`, `hobbies[1:]`. They don't change the key, so `{hobbies[0]}` gives `{"hobbies":...}`.
+- The value is shaped as described at the top: one result as it is, several in an array, and a slice always in an array.
+- A path may continue with `.` and another path. It may also end with a `{...}`, whose entries go straight into the result, so `{last.{first,name}}` is the same as `{last.first,last.name}`.
+- Two entries can't have the same key: `{age,age}`, `{Tim.age,Fred.age}` and `{hobbies[0],hobbies[1]}` are invalid. Different keys can come from the same property: `{last,last.name}` is fine.
 - Only names, array steps and `{...}` can appear in a path, not `*`, `*^` or `/regex/`.
 
 ### All properties: `*`
@@ -133,9 +137,10 @@ Once a step has given several results (`*`, `*^`, `/regex/`, `/regex/^`, `name^`
 | `*.hobbies[1:]` | `["yodelling","chess"]` |
 
 - Missing properties, and properties that are `null`, are left out, so `*.age` gives `[53,50]`.
+- Steps after `*^`, `name^` or `/regex/^` leave out objects with no matching keys, instead of giving `{}` for them. So `*./^h/^[0]` gives only `{"hobbies":"bridge"}`, from `Fred`.
 - A property that holds an array gives its elements, one level deep, so `*.hobbies` is the same as `*.hobbies[]`.
 - When an array step follows the property, the array is kept whole for that step, so `*.hobbies[0]` gives the first hobby of each person who has any.
-- Before any fan-out, nothing is left out or flattened: `Fred.hobbies` is one array, and `nobody` is `null`. The steps after `*^` also start afresh for each key, so `*^.hobbies` gives `"Tim":null`.
+- Before any fan-out, nothing is left out or flattened: `Fred.hobbies` is one array, and `nobody` is `null`. The steps after `*^` also start afresh for each key, so `*^.hobbies` gives `"Tim":null`, which `--keep-nulls` shows.
 
 ### All keys: `*^`
 
@@ -155,7 +160,7 @@ When more steps follow `*^`, the result is a new object with the same keys. Each
 
 | Query | Output |
 |---|---|
-| `*^.age` | `{"Tim":53,"Fred":50,"user_1":null,"user_2":null}` |
+| `*^.age` | `{"Tim":53,"Fred":50}`, or with `--keep-nulls`: `{"Tim":53,"Fred":50,"user_1":null,"user_2":null}` |
 | `*^.*` | `{"Tim":53,"Fred":[50,["bridge","yodelling","chess"]],"user_1":"ann","user_2":"bob"}` |
 | `*^.*^` | `{"Tim":"age","Fred":["age","hobbies"],"user_1":"name","user_2":"name"}` |
 
@@ -241,7 +246,7 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 
 ## Errors
 
-`jt` prints errors to stderr as `jt: <message>` and exits with status 1.
+`jt` prints errors to stderr as `jt: <message>` and exits with status 1. A bad command line, such as a missing query or an unknown option, prints a usage message and exits with status 2.
 
 | Message | Cause | Example |
 |---|---|---|
@@ -254,4 +259,4 @@ On `null`:
 - `*`, `*^`, `/regex/`, `/regex/^` and `name^` are errors.
 - `name` and `[n]` return `null`, which is left out after a fan-out.
 - `[]` and `[start:stop]` give no results.
-- `{a,b}` returns an object whose listed properties are all `null`. Each path in it runs on `null`, so `{last.name}` gives `{"last":{"name":null}}`.
+- `{a,b}` returns an object whose listed properties are all `null`. Each path in it runs on `null`, so `{last.name}` gives `{"name":null}`, printed as `{}` without `--keep-nulls`.

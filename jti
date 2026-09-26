@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# jti: interactive jt. Type a query and see its result on the file live.
+#
+#   jti <file.json>
+
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: jti <file.json>" >&2
+    exit 1
+fi
+
+file=$1
+if [[ ! -r $file ]]; then
+    echo "jti: cannot read '$file'" >&2
+    exit 1
+fi
+
+# Use jt from PATH, or the release build next to this script.
+if command -v jt >/dev/null; then
+    jt=$(command -v jt)
+else
+    jt="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target/release/jt"
+    if [[ ! -x $jt ]]; then
+        echo "jti: jt not found; run 'cargo build --release' or put jt on PATH" >&2
+        exit 1
+    fi
+fi
+
+# fzf gets an empty list, so there are no items or matches to show. The
+# query is only fed to the preview, which fills the whole window.
+export JTI_JT=$jt JTI_FILE=$file
+: | fzf \
+    --disabled \
+    --prompt 'jt> ' \
+    --info hidden \
+    --no-separator \
+    --preview '"$JTI_JT" -C {q} "$JTI_FILE" 2>&1' \
+    --preview-window 'up,99%,wrap,border-none' \
+    --bind 'enter:ignore' \
+    || true

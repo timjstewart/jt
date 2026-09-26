@@ -28,7 +28,7 @@ impl fmt::Display for ParseError {
 impl Error for ParseError {}
 
 /// Selects the properties of an object by key.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pattern {
     /// Every key: `*`.
     Any,
@@ -61,12 +61,12 @@ impl PartialEq for Pattern {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     // Object operations
     Property(String),
-    /// A new object holding only the listed properties, in the order listed:
-    /// `{a,b}`. Each entry's steps are applied to its property's value.
+    /// A new object holding only the listed entries, in the order listed:
+    /// `{a,b.c}`. See [`PickEntry`].
     PropertyPick(Vec<PickEntry>),
     /// The values of the properties whose keys match: `*` or `/regex/`.
     PropertyValues(Pattern),
@@ -103,9 +103,17 @@ impl Op {
     }
 }
 
-/// One property of a `{...}` pick: its name, and the steps applied to its value.
-/// `hobbies[0]` is `("hobbies", [[0]])`, and `last.name` is `last.{name}`.
-pub type PickEntry = (String, Vec<Op>);
+/// One entry of a `{...}` pick: the property `name` to read, the `steps` run
+/// on its value, and the `key` the result is stored under, which is the last
+/// name in the path. `hobbies[0]` reads `hobbies` and runs `[0]` on it under the
+/// key `hobbies`, and `work.department` reads `work` and runs `department` on it
+/// under the key `department`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickEntry {
+    pub key: String,
+    pub name: String,
+    pub steps: Vec<Op>,
+}
 
 /// Parses a query. An empty query has no steps. A query may not start with
 /// `.`: write `a.b`, not `.a.b`.
@@ -253,12 +261,16 @@ fn parse_selector(chunk: &str) -> Result<Option<Op>, ParseError> {
     }))
 }
 
-/// Parses the `a,b.c` inside `{a,b.c}`.
+/// Parses the `a,b.c` inside `{a,b.c}`. Two entries may not have the same key.
 fn parse_pick_list(list: &str) -> Result<Vec<PickEntry>, ParseError> {
-    let mut entries = vec![];
+    let mut entries: Vec<PickEntry> = vec![];
     for path in split_top_level_commas(list) {
-        let chunks = split_chunks(path)?;
-        merge_pick_entry(&mut entries, parse_pick_path(&chunks)?)?;
+        for entry in parse_pick_path(&split_chunks(path)?)? {
+            if entries.iter().any(|e| e.key == entry.key) {
+                return Err(ParseError::InvalidQuery);
+            }
+            entries.push(entry);
+        }
     }
     Ok(entries)
 }
@@ -285,50 +297,52 @@ fn split_top_level_commas(list: &str) -> Vec<&str> {
 
 /// Parses one path of a pick, such as `age`, `hobbies[0]` or `last.name`.
 /// It starts with a property name, which may be followed by array steps, and
-/// may end with another property, which is picked in turn, or a `{...}`.
-fn parse_pick_path(chunks: &[&str]) -> Result<PickEntry, ParseError> {
+/// may end with another path or a `{...}`. A path gives one entry, keyed by its
+/// last name, except one ending in `{...}`, which gives an entry for each entry
+/// in the braces: `a.{b,c}` is `a.b,a.c`.
+fn parse_pick_path(chunks: &[&str]) -> Result<Vec<PickEntry>, ParseError> {
     let Some((name, mut rest)) = chunks.split_first() else {
         return Err(ParseError::InvalidQuery);
     };
     if !PROPERTY_REGEX.is_match(name) {
         return Err(ParseError::InvalidQuery);
     }
-    let mut ops = vec![];
+    let name = (*name).to_owned();
+    let mut steps = vec![];
     while let Some((chunk, after)) = rest.split_first() {
-        if PROPERTY_REGEX.is_match(chunk) {
-            ops.push(Op::PropertyPick(vec![parse_pick_path(rest)?]));
-            break;
-        }
-        match parse_chunk(chunk)? {
-            op @ Op::PropertyPick(_) if after.is_empty() => ops.push(op),
-            op @ (Op::Array | Op::ArrayIndex(_) | Op::ArraySlice { .. }) => ops.push(op),
-            _ => return Err(ParseError::InvalidQuery),
-        }
-        rest = after;
-    }
-    Ok(((*name).to_owned(), ops))
-}
-
-/// Adds `entry` to `entries`. Each property is moved out of its object and can
-/// only be taken once, so a name may only repeat when both entries pick from
-/// it, as in `{a.b,a.c}`, and then the two picks are merged: `{a.{b,c}}`.
-fn merge_pick_entry(
-    entries: &mut Vec<PickEntry>,
-    (name, ops): PickEntry,
-) -> Result<(), ParseError> {
-    let Some((_, existing)) = entries.iter_mut().find(|(n, _)| *n == name) else {
-        entries.push((name, ops));
-        return Ok(());
-    };
-    match (existing.as_mut_slice(), <[Op; 1]>::try_from(ops)) {
-        ([Op::PropertyPick(existing)], Ok([Op::PropertyPick(new)])) => {
-            for entry in new {
-                merge_pick_entry(existing, entry)?;
+        let tail = if PROPERTY_REGEX.is_match(chunk) {
+            parse_pick_path(rest)?
+        } else {
+            match parse_chunk(chunk)? {
+                Op::PropertyPick(entries) if after.is_empty() => entries,
+                op if op.is_array_step() => {
+                    steps.push(op);
+                    rest = after;
+                    continue;
+                }
+                _ => return Err(ParseError::InvalidQuery),
             }
-            Ok(())
-        }
-        _ => Err(ParseError::InvalidQuery),
+        };
+        // Each entry of the tail reads its property from this one's value.
+        return Ok(tail
+            .into_iter()
+            .map(|entry| {
+                let mut path = steps.clone();
+                path.push(Op::Property(entry.name));
+                path.extend(entry.steps);
+                PickEntry {
+                    key: entry.key,
+                    name: name.clone(),
+                    steps: path,
+                }
+            })
+            .collect());
     }
+    Ok(vec![PickEntry {
+        key: name.clone(),
+        name,
+        steps,
+    }])
 }
 
 #[cfg(test)]
@@ -592,9 +606,7 @@ mod tests {
 
     #[test]
     fn parse_pick() {
-        let props = |names: &[&str]| {
-            Op::PropertyPick(names.iter().map(|n| (n.to_string(), vec![])).collect())
-        };
+        let props = |names: &[&str]| pick(names.iter().map(|n| (*n, *n, vec![])).collect());
         assert_eq!(parse("a.{b,c}"), Ok(vec![prop("a"), props(&["b", "c"])]));
         assert_eq!(parse("{b}"), Ok(vec![props(&["b"])]));
         assert_eq!(
@@ -603,22 +615,27 @@ mod tests {
         );
     }
 
-    fn pick(entries: Vec<(&str, Vec<Op>)>) -> Op {
+    /// A pick of `(key, name, steps)` entries.
+    fn pick(entries: Vec<(&str, &str, Vec<Op>)>) -> Op {
         Op::PropertyPick(
             entries
                 .into_iter()
-                .map(|(n, ops)| (n.to_string(), ops))
+                .map(|(key, name, steps)| PickEntry {
+                    key: key.to_string(),
+                    name: name.to_string(),
+                    steps,
+                })
                 .collect(),
         )
     }
 
     #[test]
-    fn parse_pick_paths() {
+    fn parse_pick_paths_are_keyed_by_last_name() {
         assert_eq!(
             parse("{age,hobbies[0]}"),
             Ok(vec![pick(vec![
-                ("age", vec![]),
-                ("hobbies", vec![Op::ArrayIndex(0)])
+                ("age", "age", vec![]),
+                ("hobbies", "hobbies", vec![Op::ArrayIndex(0)])
             ])])
         );
         assert_eq!(
@@ -626,8 +643,8 @@ mod tests {
             Ok(vec![
                 prop("a"),
                 pick(vec![
-                    ("age", vec![]),
-                    ("last", vec![pick(vec![("name", vec![])])])
+                    ("age", "age", vec![]),
+                    ("name", "last", vec![prop("name")])
                 ]),
                 prop("b")
             ])
@@ -635,54 +652,52 @@ mod tests {
         assert_eq!(
             parse("{f[0].n[]}"),
             Ok(vec![pick(vec![(
+                "n",
                 "f",
-                vec![Op::ArrayIndex(0), pick(vec![("n", vec![Op::Array])])]
+                vec![Op::ArrayIndex(0), prop("n"), Op::Array]
             )])])
+        );
+        assert_eq!(
+            parse("{a.b.c}"),
+            Ok(vec![pick(vec![("c", "a", vec![prop("b"), prop("c")])])])
         );
     }
 
     #[test]
     fn parse_pick_paths_ending_in_braces() {
         assert_eq!(parse("{a.{b,c}}"), parse("{a.b,a.c}"));
+        assert_eq!(parse("{a.{b,c.d},x,a.c.{e}}"), parse("{a.b,a.c.d,x,a.c.e}"));
         assert_eq!(
             parse("{a[1:].{b}}"),
             Ok(vec![pick(vec![(
+                "b",
                 "a",
                 vec![
                     Op::ArraySlice {
                         start: Some(1),
                         stop: None
                     },
-                    pick(vec![("b", vec![])])
+                    prop("b")
                 ]
             )])])
         );
     }
 
     #[test]
-    fn parse_pick_merges_shared_paths() {
-        let expected = Ok(vec![pick(vec![
-            (
-                "a",
-                vec![pick(vec![
-                    ("b", vec![]),
-                    ("c", vec![pick(vec![("d", vec![]), ("e", vec![])])]),
-                ])],
-            ),
-            ("x", vec![]),
-        ])]);
-        assert_eq!(parse("{a.b,a.c.d,x,a.c.e}"), expected);
-        assert_eq!(parse("{a.{b,c.d},x,a.c.{e}}"), expected);
+    fn parse_pick_allows_shared_names_with_different_keys() {
+        for q in ["{a.b,a}", "{a,a.b}", "{a[0],a.b}", "{a.b,a.c}"] {
+            assert!(parse(q).is_ok(), "expected ok for {q:?}");
+        }
     }
 
     #[test]
     fn parse_pick_rejects_invalid_paths() {
         for q in [
-            "{a.b,a}",
-            "{a,a.b}",
             "{a.b,a.b}",
             "{a[0],a[1]}",
-            "{a[0],a.b}",
+            "{a.b,c.b}",
+            "{b,a.b}",
+            "{a.{b,c},c}",
             "{[0]}",
             "{a.[0]}",
             "{a.*}",
