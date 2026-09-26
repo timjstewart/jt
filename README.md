@@ -6,7 +6,7 @@ A small command-line tool for pulling values out of JSON, in the spirit of `jq`.
 jt [-C|--color] [--keep-nulls] <query> [file]
 ```
 
-`jt` reads JSON from `file`, or from stdin if no file is given, runs the query, and pretty-prints the result. A query that gives one result prints it on its own. A query that gives several, or none, prints them as a JSON array. A query with a slice (`[start:stop]`) always prints an array:
+`jt` reads JSON from `file`, or from stdin if no file is given, runs the query, and pretty-prints the result. A query that gives one result prints it on its own. A query that gives several, or none, prints them as a JSON array. A query with `[]` or a slice (`[start:stop]`) asks for array elements, so it always prints an array, even of one element:
 
 ```sh
 $ jt 'Fred.hobbies[]' people.json
@@ -71,6 +71,8 @@ A query is a list of steps separated by `.`, such as `Tim.age`. A query can't st
 | `/regex/` | object | every property value whose key matches `regex` |
 | `/regex/^` | object | every property key that matches `regex` |
 | `name^` | object | every property key that contains `name` |
+| `**.step` | anything | `step` run on every object at any depth |
+| `**^.step` | anything | the input pruned down to what `step` finds at any depth |
 | `[]` | array | every element |
 | `[n]` | array | the element at index `n` |
 | `[start:stop]` | array | every element in a range, like a Python slice |
@@ -110,7 +112,7 @@ Property names may contain only letters, `_` and `-`. To reach a key with other 
 Each entry in the list can be a path instead of a single name. The key is the last name in the path, and the value is what the path gives, so `{name,work.department}` gives `{"name":...,"department":...}`:
 
 - A path starts with a property name. Array steps may follow any name: `hobbies[0]`, `hobbies[]`, `hobbies[1:]`. They don't change the key, so `{hobbies[0]}` gives `{"hobbies":...}`.
-- The value is shaped as described at the top: one result as it is, several in an array, and a slice always in an array.
+- The value is shaped as described at the top: one result as it is, several in an array, and with `[]` or a slice always in an array.
 - A path may continue with `.` and another path. It may also end with a `{...}`, whose entries go straight into the result, so `{last.{first,name}}` is the same as `{last.first,last.name}`.
 - Two entries can't have the same key: `{age,age}`, `{Tim.age,Fred.age}` and `{hobbies[0],hobbies[1]}` are invalid. Different keys can come from the same property: `{last,last.name}` is fine.
 - Only names, array steps and `{...}` can appear in a path, not `*`, `*^` or `/regex/`.
@@ -127,7 +129,7 @@ Values come back in the order they appear in the document.
 
 #### Properties after a fan-out
 
-Once a step has given several results (`*`, `*^`, `/regex/`, `/regex/^`, `name^`, `[]` or a slice), later property steps work across all of them:
+Once a step has given several results (`*`, `*^`, `/regex/`, `/regex/^`, `name^`, `**`, `[]` or a slice), later property steps work across all of them:
 
 | Query | Output |
 |---|---|
@@ -164,7 +166,7 @@ When more steps follow `*^`, the result is a new object with the same keys. Each
 | `*^.*` | `{"Tim":53,"Fred":[50,["bridge","yodelling","chess"]],"user_1":"ann","user_2":"bob"}` |
 | `*^.*^` | `{"Tim":"age","Fred":["age","hobbies"],"user_1":"name","user_2":"name"}` |
 
-- A single result is stored as it is. When the steps give several results, or none, they are collected into an array, as `Fred` shows in `*^.*`. When the steps include a slice, the value is always an array.
+- A single result is stored as it is. When the steps give several results, they are collected into an array, as `Fred` shows in `*^.*`. When they give none, the value is `null`, the same as a missing property, so `*^.hobbies[]` gives only `{"Fred":["bridge","yodelling","chess"]}`. When the steps include `[]` or a slice, the value is always an array, even of one element. With a slice it is an array even when empty; with `[]`, no results still gives `null`.
 - The remaining steps run on every value, so they must suit all of them. `*^.age[]` fails with `not an array`, because every age is a number.
 - A second `*^` in the remaining steps works the same way, one level down.
 
@@ -208,11 +210,53 @@ A shorter way to write `/name/^` when the pattern is a plain name. It matches th
 - The name follows the same rules as `name`: letters, `_` and `-`.
 - Without the `^`, `name` is a single property, not a pattern.
 
+### Any depth: `**`
+
+| Query | Output |
+|---|---|
+| `**.age` | `[53,50]` |
+| `**.name` | `["ann","bob"]` |
+| `**.hobbies[0]` | `"bridge"` |
+| `**.nam^` | `["name","name"]` |
+| `Fred.**.age` | `50` |
+
+- `**` runs the step after it on every object inside the value, at any depth: the value itself if it's an object, the objects in its properties, the objects in arrays, and so on down.
+- The step after `**` must work on objects: `name`, `{a,b}`, `*`, `*^`, `/regex/`, `/regex/^` or `name^`. `**` on its own, `**[0]` and `**.**` are invalid.
+- `**` is a fan-out, so the step after it follows the rules in [Properties after a fan-out](#properties-after-a-fan-out): `**.name` leaves out the objects that have no `name`, and `**.hobbies` gives each hobby.
+- Results come in document order, with each object's results before those of the objects inside it. If a match holds another match, both are returned, the outer one first: on `{"a":{"a":1}}`, `**.a` gives `[{"a":1},1]`.
+- A pick runs on every object, so `**.{name}` gives an object for each one, and those without `name` print as `{}`.
+- `**` can't appear inside `{...}`.
+
+#### Where things are: `**^`
+
+`**^` shows where `**` finds things. When steps follow it, the result is a copy of the input pruned down to what the steps find, reached by the same keys as in the input. Each object where they find something holds it, and everything else is left out.
+
+| Query | Output |
+|---|---|
+| `**^.age` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+| `**^.hobbies[0]` | `{"Fred":{"hobbies":"bridge"}}` |
+| `**^./^n/` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
+| `**^.{name,age}` | `{"Tim":{"age":53},"Fred":{"age":50},"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
+| `**^` | `{"Tim":{},"Fred":{},"user_1":{},"user_2":{}}` |
+
+- What the steps find is kept under a key in the object where they found it:
+  - After `*`, `/regex/`, `*^`, `name^` or `/regex/^`, under each matching key. Any steps after those run on its value, so on `{"work":{"department":"sales"}}`, `**^.w^.department` gives `{"work":"sales"}`.
+  - For a pick, under the pick's own keys. A pick must be the last step.
+  - Otherwise under the last name, as in a pick: `**^.work.department` keeps `{"department":...}`.
+- An object where the steps find nothing is left out: no results, `null`, or an empty object from `*^`, `name^` or `/regex/^`. A pick's properties that are missing are left out too.
+- Matches inside matches are kept, since the outer one holds the inner one: on `{"age":40,"kid":{"age":5}}`, `**^.age` gives the input unchanged.
+- An array element in the path is kept under a key like `"[1]"`, so the result is all objects: on `{"L":[{},{"a":1}]}`, `**^.a` gives `{"L":{"[1]":{"a":1}}}`.
+- With no steps, `**^` gives every object, emptied: the shape of the input.
+- As after `*^`, the steps after `**^` start afresh on each object, so they don't leave out nulls or flatten arrays. The first of them must work on objects.
+- All the steps after `**^` belong to it, including any later `**` or `**^`: `**^.work.**.department` keeps the departments anywhere inside each `work`, under `work`.
+
 ### Array elements: `[]`
 
 | Query | Output |
 |---|---|
 | `Fred.hobbies[]` | `["bridge","yodelling","chess"]` |
+
+`[]` always gives an array, even when there is only one element: on `{"h":["golf"]}`, `h[]` gives `["golf"]`, while `h[0]` gives `"golf"`.
 
 Array steps are written straight after the step before them, with no `.`: `hobbies[]`, not `hobbies.[]`. They chain the same way: `a[0][1]`. A query can also start with an array step: `[0]`.
 
@@ -257,6 +301,7 @@ Slices work like Python slices without a step. `start` is included, `stop` is no
 
 On `null`:
 - `*`, `*^`, `/regex/`, `/regex/^` and `name^` are errors.
+- `**` gives no results, as it does on any value with no objects in it.
 - `name` and `[n]` return `null`, which is left out after a fan-out.
 - `[]` and `[start:stop]` give no results.
 - `{a,b}` returns an object whose listed properties are all `null`. Each path in it runs on `null`, so `{last.name}` gives `{"name":null}`, printed as `{}` without `--keep-nulls`.

@@ -76,6 +76,13 @@ pub enum Op {
     /// that match, where each value is the result of running the steps on the
     /// old value, shaped as described by `collect` in the exec module.
     PropertyMap(Pattern, Vec<Op>),
+    /// An object step run on every object at any depth, outer objects before
+    /// the ones inside them: `**` and the step after it, as in `**.name`.
+    Descend(Box<Op>),
+    /// `**^` and the steps after it: a new object with the path to every object
+    /// at any depth, such as `a.b[0]`, where the steps find something, and
+    /// what they find. With no steps, the paths themselves.
+    DescendPaths(Vec<Op>),
     // Array operations
     Array,
     ArrayIndex(usize),
@@ -90,7 +97,23 @@ impl Op {
     pub fn fans_out(&self) -> bool {
         matches!(
             self,
-            Self::PropertyValues(_) | Self::PropertyKeys(_) | Self::Array | Self::ArraySlice { .. }
+            Self::PropertyValues(_)
+                | Self::PropertyKeys(_)
+                | Self::Descend(_)
+                | Self::Array
+                | Self::ArraySlice { .. }
+        )
+    }
+
+    /// Whether this op works on an object.
+    pub fn is_object_step(&self) -> bool {
+        matches!(
+            self,
+            Self::Property(_)
+                | Self::PropertyPick(_)
+                | Self::PropertyValues(_)
+                | Self::PropertyKeys(_)
+                | Self::PropertyMap(..)
         )
     }
 
@@ -121,23 +144,69 @@ pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
     if query.is_empty() {
         return Ok(vec![]);
     }
-    let ops: Vec<Op> = split_chunks(query)?
-        .into_iter()
-        .map(parse_chunk)
-        .collect::<Result<_, _>>()?;
+    parse_chunks(&split_chunks(query)?)
+}
+
+fn parse_chunks(chunks: &[&str]) -> Result<Vec<Op>, ParseError> {
+    let mut ops = vec![];
+    let mut rest = chunks;
+    while let Some((&chunk, after)) = rest.split_first() {
+        rest = after;
+        let op = match chunk {
+            // `**` must be followed by an object step, which it runs at every depth.
+            "**" => match rest.split_first() {
+                Some((&next, after)) => {
+                    rest = after;
+                    match parse_chunk(next)? {
+                        op if op.is_object_step() => Op::Descend(Box::new(op)),
+                        _ => return Err(ParseError::InvalidQuery),
+                    }
+                }
+                None => return Err(ParseError::InvalidQuery),
+            },
+            // `**^` takes all the steps after it, which must start with an
+            // object step. A pick builds the object for each path, so it must be last.
+            "**^" => {
+                let steps = parse_chunks(rest)?;
+                let valid = match steps.as_slice() {
+                    [] | [Op::PropertyPick(_)] => true,
+                    [Op::PropertyPick(_), ..] => false,
+                    [first, ..] => first.is_object_step(),
+                };
+                if !valid {
+                    return Err(ParseError::InvalidQuery);
+                }
+                rest = &[];
+                Op::DescendPaths(steps)
+            }
+            chunk => parse_chunk(chunk)?,
+        };
+        ops.push(op);
+    }
     Ok(nest_after_keys(ops))
 }
 
 /// Replaces the first `*^`, `name^` or `/regex/^` that has steps after it with a [`Op::PropertyMap`]
-/// holding those steps, and does the same within them.
+/// holding those steps, and does the same within them. A keys step after `**`
+/// is replaced inside its [`Op::Descend`].
 fn nest_after_keys(mut ops: Vec<Op>) -> Vec<Op> {
-    if let Some(i) = ops.iter().position(|op| matches!(op, Op::PropertyKeys(_)))
+    let is_keys = |op: &Op| match op {
+        Op::Descend(op) => matches!(**op, Op::PropertyKeys(_)),
+        op => matches!(op, Op::PropertyKeys(_)),
+    };
+    if let Some(i) = ops.iter().position(is_keys)
         && i + 1 < ops.len()
     {
         let rest = nest_after_keys(ops.split_off(i + 1));
         // After the split, the keys op is the last op.
-        if let Some(Op::PropertyKeys(pattern)) = ops.pop() {
-            ops.push(Op::PropertyMap(pattern, rest));
+        match ops.pop() {
+            Some(Op::PropertyKeys(pattern)) => ops.push(Op::PropertyMap(pattern, rest)),
+            Some(Op::Descend(op)) => {
+                if let Op::PropertyKeys(pattern) = *op {
+                    ops.push(Op::Descend(Box::new(Op::PropertyMap(pattern, rest))));
+                }
+            }
+            _ => {}
         }
     }
     ops
@@ -736,7 +805,7 @@ mod tests {
     #[test]
     fn parse_keys() {
         assert_eq!(parse("*^"), Ok(vec![Op::PropertyKeys(Pattern::Any)]));
-        for q in ["^", "a.^", "^.a", "*.^", "**^", "*^^", "^*"] {
+        for q in ["^", "a.^", "^.a", "*.^", "*^^", "^*"] {
             assert!(parse(q).is_err(), "expected error for {q:?}");
         }
         assert_eq!(
@@ -796,6 +865,87 @@ mod tests {
     #[test]
     fn parse_regex_keys_rejects_invalid() {
         for q in ["/a/^^", "/a/^b", "/a/^/", "/(/^", "/^"] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
+    fn parse_descend() {
+        let descend = |op| Op::Descend(Box::new(op));
+        assert_eq!(parse("**.a"), Ok(vec![descend(prop("a"))]));
+        assert_eq!(
+            parse("x.**.a.b"),
+            Ok(vec![prop("x"), descend(prop("a")), prop("b")])
+        );
+        assert_eq!(parse("**./^a/"), Ok(vec![descend(re("^a"))]));
+        assert_eq!(
+            parse("**.*^"),
+            Ok(vec![descend(Op::PropertyKeys(Pattern::Any))])
+        );
+        assert_eq!(
+            parse("**.a^.b"),
+            Ok(vec![descend(Op::PropertyMap(
+                Pattern::Contains("a".to_owned()),
+                vec![prop("b")]
+            ))])
+        );
+        assert_eq!(
+            parse("*^.**.a"),
+            Ok(vec![Op::PropertyMap(
+                Pattern::Any,
+                vec![descend(prop("a"))]
+            )])
+        );
+        assert!(
+            matches!(&parse("**.{a,b}").unwrap()[..], [Op::Descend(op)] if matches!(**op, Op::PropertyPick(_)))
+        );
+    }
+
+    #[test]
+    fn parse_descend_paths() {
+        assert_eq!(parse("**^"), Ok(vec![Op::DescendPaths(vec![])]));
+        assert_eq!(
+            parse("x.**^.a.b"),
+            Ok(vec![
+                prop("x"),
+                Op::DescendPaths(vec![prop("a"), prop("b")])
+            ])
+        );
+        assert_eq!(
+            parse("**^.a^.b"),
+            Ok(vec![Op::DescendPaths(vec![Op::PropertyMap(
+                Pattern::Contains("a".to_owned()),
+                vec![prop("b")]
+            )])])
+        );
+        assert_eq!(
+            parse("*^.**^.a"),
+            Ok(vec![Op::PropertyMap(
+                Pattern::Any,
+                vec![Op::DescendPaths(vec![prop("a")])]
+            )])
+        );
+        for q in [
+            "**^[0]",
+            "**^.[0]",
+            "**^.**.a",
+            "**^.**^",
+            "**^^",
+            "{**^.a}",
+            "**^.a.$",
+            "**^.{a}.a",
+            "**^.{a}[0]",
+        ] {
+            assert!(parse(q).is_err(), "expected error for {q:?}");
+        }
+    }
+
+    #[test]
+    fn parse_descend_rejects_invalid() {
+        for q in [
+            "**", "a.**", "**.**.a", "**[0]", "**.[0]", "**a", "a**", "***", "{**.a}", "{a.**.b}",
+            "**.$",
+        ] {
             assert!(parse(q).is_err(), "expected error for {q:?}");
         }
     }

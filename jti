@@ -40,7 +40,7 @@ export JTI_JT=$jt JTI_FILE=$file
     --prompt 'jt> ' \
     --info hidden \
     --no-separator \
-    --preview '"$JTI_JT" -C {q} "$JTI_FILE" 2>&1' \
+    --preview '"$JTI_JT" -C -- {q} "$JTI_FILE" 2>&1' \
     --preview-window 'up,99%,wrap,border-none' \
     --bind 'enter:ignore' \
     || true

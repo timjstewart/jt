@@ -34,7 +34,8 @@
     "name": "qaz",
     "age": 13,
     "work": {
-      "department": "finance"
+      "department": "finance",
+      "phone": "555-1212"
     },
     "hobbies": [
       "bowling",
