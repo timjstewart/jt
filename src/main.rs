@@ -3,15 +3,14 @@ mod parser;
 
 use clap::Parser;
 use colored_json::ColorMode;
-use exec::{collect, execute};
-use parser::{Op, parse};
+use parser::{Query, parse};
 use serde_json::Value;
 use std::error::Error;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Pulls values out of JSON, in the spirit of jq.
+/// Filters JSON down to what a query finds, keeping its structure.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -39,15 +38,12 @@ fn main() -> ExitCode {
 
 /// Runs the query against the JSON in the file, or on stdin when there is no file.
 fn run(args: &Args) -> Result<(), Box<dyn Error>> {
-    let ops = parse(&args.query)?;
+    let query = parse(&args.query)?;
     let text = match &args.file {
         Some(path) => std::fs::read_to_string(path)?,
         None => io::read_to_string(io::stdin())?,
     };
-    let out = eval(&ops, text)?;
-    // A single result prints as it is, and none or several as a JSON array,
-    // except that a query with a slice always prints an array.
-    let mut value = collect(&ops, out);
+    let mut value = eval(&query, text)?;
     if !args.keep_nulls {
         remove_null_keys(&mut value);
     }
@@ -74,11 +70,11 @@ fn remove_null_keys(value: &mut Value) {
     }
 }
 
-fn eval(ops: &[Op], text: String) -> Result<Vec<Value>, Box<dyn Error>> {
+fn eval(query: &Query, text: String) -> Result<Value, Box<dyn Error>> {
     let json: Value = serde_json::from_str(&text)?;
     // The parsed document replaces the text, so free the text before running.
     drop(text);
-    Ok(execute(ops, vec![json])?)
+    Ok(exec::run(query, json))
 }
 
 #[cfg(test)]
@@ -96,7 +92,9 @@ mod tests {
     }
 
     fn query(q: &str, text: &str) -> String {
-        serde_json::to_string(&eval(&parse(q).unwrap(), text.to_owned()).unwrap()).unwrap()
+        eval(&parse(q).unwrap(), text.to_owned())
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -126,44 +124,20 @@ mod tests {
 
     #[test]
     fn eval_empty_query_returns_input() {
-        assert_eq!(query("", r#"{"a":1}"#), r#"[{"a":1}]"#);
+        assert_eq!(query("", r#"{"a":1}"#), r#"{"a":1}"#);
+        assert_eq!(query("", "[1,2]"), "[1,2]");
+        assert_eq!(query("", "7"), "7");
+    }
+
+    #[test]
+    fn eval_keeps_structure() {
+        assert_eq!(query("a", r#"{"a":1,"b":2}"#), r#"{"a":1}"#);
+        assert_eq!(query("a!", r#"{"a":1,"b":2}"#), "1");
     }
 
     #[test]
     fn eval_rejects_invalid_json() {
-        assert!(eval(&[], "{not json".to_owned()).is_err());
-    }
-
-    /// The value `run` prints for `q`, before null keys are removed, as compact JSON.
-    fn output(q: &str, text: &str) -> String {
-        let ops = parse(q).unwrap();
-        collect(&ops, eval(&ops, text.to_owned()).unwrap()).to_string()
-    }
-
-    #[test]
-    fn output_empty_query_is_input_unwrapped() {
-        assert_eq!(output("", r#"{"a":1}"#), r#"{"a":1}"#);
-        assert_eq!(output("", "[1,2]"), "[1,2]");
-        assert_eq!(output("", "7"), "7");
-    }
-
-    #[test]
-    fn output_single_result_unwrapped() {
-        assert_eq!(output("a", r#"{"a":1}"#), "1");
-        assert_eq!(output("a", r#"{"a":{"b":2}}"#), r#"{"b":2}"#);
-        assert_eq!(output("a", r#"{"a":[1]}"#), "[1]");
-    }
-
-    #[test]
-    fn output_slice_as_array_even_with_one_result() {
-        assert_eq!(output("*", r#"{"a":1}"#), "1");
-        assert_eq!(output("[0:1]", "[1,2]"), "[1]");
-    }
-
-    #[test]
-    fn output_none_or_several_results_as_array() {
-        assert_eq!(output("*", "{}"), "[]");
-        assert_eq!(output("*", r#"{"a":1,"b":2}"#), "[1,2]");
+        assert!(eval(&parse("").unwrap(), "{not json".to_owned()).is_err());
     }
 
     #[test]

@@ -4,7 +4,8 @@
     "age": 33,
     "hobbies": [
       "golf"
-    ]
+    ],
+    "homeruns": 3
   },
   "Fred": {
     "name": "bar",
