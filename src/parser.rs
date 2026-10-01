@@ -1,4 +1,4 @@
-//! The query language: turns query text into a [`Query`].
+//! The query language: turns query text into a list of [`Op`]s.
 
 use regex::Regex;
 use std::error::Error;
@@ -86,34 +86,31 @@ pub enum Op {
         start: Option<isize>,
         stop: Option<isize>,
     },
-}
-
-/// A parsed query: the steps, and whether it ends in `!`, which unwraps the
-/// values the last step finds from the object or array that holds them.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Query {
-    pub ops: Vec<Op>,
-    pub unwrap: bool,
+    /// A step that selects properties or elements, followed by `!`, which
+    /// leaves its keys or indexes out of the path: the object or array it
+    /// selects from is replaced by what it selects.
+    Unwrap(Box<Op>),
 }
 
 /// Parses a query. An empty query has no steps. A query may not start with
 /// `.`, but may end with one, which is ignored so that a query stays valid
-/// while it is being typed: `a.` is the same as `a`.
-pub fn parse(query: &str) -> Result<Query, ParseError> {
-    let (text, unwrap) = match query.strip_suffix('!') {
-        Some(text) => (text, true),
-        None => (query, false),
-    };
-    let text = match text.strip_suffix('.') {
+/// while it is being typed: `a.` is the same as `a`. For the same reason, an
+/// array step left open at the very end is closed: `a[` is the same as `a[]`,
+/// `a[3` as `a[3]`, and `a[1:` as `a[1:]`.
+pub fn parse(query: &str) -> Result<Vec<Op>, ParseError> {
+    let text = match query.strip_suffix('.') {
         Some(rest) if !rest.is_empty() => rest,
-        _ => text,
+        _ => query,
     };
-    let ops = if text.is_empty() && !unwrap {
-        vec![]
-    } else {
-        parse_path(text)?
-    };
-    Ok(Query { ops, unwrap })
+    if text.is_empty() {
+        return Ok(vec![]);
+    }
+    if let Some(open) = text.rfind('[')
+        && !text[open..].contains(']')
+    {
+        return parse_path(&format!("{text}]"));
+    }
+    parse_path(text)
 }
 
 /// Parses a path of steps separated by `.`, such as `a.b[0]`.
@@ -179,7 +176,7 @@ fn separators(text: &str) -> Result<Vec<(usize, char)>, ParseError> {
                 state = State::InRegex;
                 continue;
             }
-            State::RegexClosed if !matches!(c, '.' | '[' | ',' | '}') => {
+            State::RegexClosed if !matches!(c, '.' | '[' | ',' | '}' | '!') => {
                 return Err(ParseError::InvalidQuery);
             }
             State::RegexClosed | State::Plain => state = State::Plain,
@@ -244,6 +241,15 @@ fn split_commas(list: &str) -> Result<Vec<&str>, ParseError> {
 }
 
 fn parse_chunk(chunk: &str) -> Result<Op, ParseError> {
+    // A regex may end in `!`, so `/a!/` has no `!` step: it ends in `/`.
+    if let Some(step) = chunk.strip_suffix('!') {
+        return match parse_chunk(step)? {
+            op @ (Op::Keys(_) | Op::Array | Op::ArrayIndex(_) | Op::ArraySlice { .. }) => {
+                Ok(Op::Unwrap(Box::new(op)))
+            }
+            _ => Err(ParseError::InvalidQuery),
+        };
+    }
     match chunk {
         "**" => return Ok(Op::Descend),
         "*" => return Ok(Op::Keys(Pattern::Any)),
@@ -308,9 +314,11 @@ mod tests {
     }
 
     fn ops(query: &str) -> Vec<Op> {
-        let parsed = parse(query).unwrap();
-        assert!(!parsed.unwrap, "{query:?} unwraps");
-        parsed.ops
+        parse(query).unwrap()
+    }
+
+    fn unwrap(op: Op) -> Op {
+        Op::Unwrap(Box::new(op))
     }
 
     fn assert_invalid(queries: &[&str]) {
@@ -371,20 +379,54 @@ mod tests {
     fn parse_ignores_a_trailing_dot() {
         assert_eq!(parse("Tim."), parse("Tim"));
         assert_eq!(parse("*.a[0]."), parse("*.a[0]"));
-        assert_eq!(parse("Tim.!"), parse("Tim!"));
+    }
+
+    #[test]
+    fn parse_reads_a_trailing_bracket_as_every_element() {
+        assert_eq!(parse("a["), parse("a[]"));
+        assert_eq!(parse("["), parse("[]"));
+        assert_eq!(parse("a[0]["), parse("a[0][]"));
+        assert_eq!(parse("a!["), parse("a![]"));
+        assert_eq!(parse("a[3"), parse("a[3]"));
+        assert_eq!(parse("a[12"), parse("a[12]"));
+        assert_eq!(parse("a[1:"), parse("a[1:]"));
+        assert_eq!(parse("a[-2:"), parse("a[-2:]"));
+        assert_eq!(parse("a[:-1"), parse("a[:-1]"));
+        // Only at the very end, and not inside a regex or braces.
+        assert_invalid(&[
+            "a[.b", "a[[", "a.[", "/a[", "{a[", "{a[}", "a[!", "a[3.b", "a[x", "a[-", "a[1:-",
+        ]);
     }
 
     #[test]
     fn parse_unwrap() {
+        assert_eq!(ops("Fred.age!"), vec![name("Fred"), unwrap(name("age"))]);
         assert_eq!(
-            parse("Fred.age!"),
-            Ok(Query {
-                ops: vec![name("Fred"), name("age")],
-                unwrap: true
-            })
+            ops("**.car!.cou"),
+            vec![Op::Descend, unwrap(name("car")), name("cou")]
         );
-        assert!(parse("/a!/").is_ok_and(|q| !q.unwrap));
-        assert_invalid(&["!", "a!!", "a!.b", "{a!}", ".!"]);
+        assert_eq!(
+            ops("a$!.*!./b/![0]![1:]!"),
+            vec![
+                unwrap(exact("a")),
+                unwrap(Op::Keys(Pattern::Any)),
+                unwrap(re("b")),
+                unwrap(Op::ArrayIndex(0)),
+                unwrap(Op::ArraySlice {
+                    start: Some(1),
+                    stop: None
+                })
+            ]
+        );
+        assert_eq!(
+            ops("{a!,b}"),
+            vec![Op::Branches(vec![vec![unwrap(name("a"))], vec![name("b")]])]
+        );
+        // A `!` inside a regex is part of it.
+        assert_eq!(ops("/a!/"), vec![re("a!")]);
+        assert_invalid(&[
+            "!", "a!!", ".!", "a.!", "!a", "a!b", "**!.a", "{a}!", "[]!!",
+        ]);
     }
 
     #[test]
@@ -412,8 +454,6 @@ mod tests {
             }]
         );
         assert_invalid(&[
-            "a[",
-            "a[0",
             "a[0]b",
             "a[x]",
             "a.[0]",

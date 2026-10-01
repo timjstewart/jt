@@ -5,7 +5,7 @@
 //! down to it. Working on masks lets several paths through the same value,
 //! from `{a,b}` or `**`, be combined before the output is built.
 
-use crate::parser::{Op, Query};
+use crate::parser::{Op, Pattern};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -15,14 +15,17 @@ use std::ops::Range;
 enum Mask {
     /// The whole value.
     All,
+    /// A property the query names that the object doesn't have, which is
+    /// shown as `null`.
+    Missing,
     /// Some properties of an object, and what is kept of each.
     Object(BTreeMap<String, Mask>, Unwrap),
     /// Some elements of an array, by index, and what is kept of each.
     Array(BTreeMap<usize, Mask>, Unwrap),
 }
 
-/// Whether a trailing `!` replaces an object or array with the values kept
-/// in it: the one value on its own, or several in an array.
+/// Whether a `!` step replaces an object or array with the values kept in
+/// it: the one value on its own, or several in an array.
 type Unwrap = bool;
 
 impl Mask {
@@ -30,6 +33,7 @@ impl Mask {
     fn union(self, other: Mask) -> Mask {
         match (self, other) {
             (Mask::All, _) | (_, Mask::All) => Mask::All,
+            (Mask::Missing, other) | (other, Mask::Missing) => other,
             (Mask::Object(mut a, ua), Mask::Object(b, ub)) => {
                 merge(&mut a, b);
                 Mask::Object(a, ua || ub)
@@ -54,12 +58,12 @@ fn merge<K: Ord>(into: &mut BTreeMap<K, Mask>, from: BTreeMap<K, Mask>) {
     }
 }
 
-/// Runs `query` on `input`, giving `input` cut down to what the query finds,
-/// with the same structure: every object and array on the way to a match is
-/// kept, holding only what leads to a match. When nothing is found, gives an
-/// empty object or array, or `null` for any other input.
-pub fn run(query: &Query, input: Value) -> Value {
-    match find(&query.ops, &input, query.unwrap) {
+/// Runs the query `ops` on `input`, giving `input` cut down to what the query
+/// finds, with the same structure: every object and array on the way to a
+/// match is kept, holding only what leads to a match. When nothing is found,
+/// gives an empty object or array, or `null` for any other input.
+pub fn run(ops: &[Op], input: Value) -> Value {
+    match find(ops, &input, true) {
         Some(mask) => keep(input, &mask),
         None => match input {
             Value::Object(_) => Value::Object(Default::default()),
@@ -71,52 +75,76 @@ pub fn run(query: &Query, input: Value) -> Value {
 
 /// What `ops` keep of `value`, or `None` if they find nothing in it. A step
 /// that doesn't suit the value, such as a name on an array, finds nothing.
-/// With `unwrap`, the object or array the last step selects from is unwrapped.
-fn find(ops: &[Op], value: &Value, unwrap: bool) -> Option<Mask> {
+///
+/// With `fill_missing`, a name that is the last step and matches no key of an
+/// object is kept as a [`Mask::Missing`] property, so you can see where it was
+/// looked for. `**` doesn't do this, or it would add the name to every object.
+fn find(ops: &[Op], value: &Value, fill_missing: bool) -> Option<Mask> {
     let Some((op, rest)) = ops.split_first() else {
         return Some(Mask::All);
     };
+    let (op, unwrap) = match op {
+        Op::Unwrap(op) => (&**op, true),
+        op => (op, false),
+    };
     match (op, value) {
         (Op::Keys(pattern), Value::Object(obj)) => {
-            let found: BTreeMap<_, _> = obj
+            let mut found: BTreeMap<_, _> = obj
                 .iter()
                 .filter(|(key, _)| pattern.is_match(key))
-                .filter_map(|(key, value)| Some((key.clone(), find(rest, value, unwrap)?)))
+                .filter_map(|(key, value)| Some((key.clone(), find(rest, value, fill_missing)?)))
                 .collect();
-            (!found.is_empty()).then_some(Mask::Object(found, unwrap && rest.is_empty()))
+            if found.is_empty()
+                && fill_missing
+                && rest.is_empty()
+                && let Pattern::Prefix(name) | Pattern::Exact(name) = pattern
+                && !obj.contains_key(name)
+            {
+                found.insert(name.clone(), Mask::Missing);
+            }
+            (!found.is_empty()).then_some(Mask::Object(found, unwrap))
         }
-        (Op::Array, Value::Array(array)) => find_elements(rest, array, 0..array.len(), unwrap),
+        (Op::Array, Value::Array(array)) => {
+            find_elements(rest, array, 0..array.len(), unwrap, fill_missing)
+        }
         (Op::ArrayIndex(n), Value::Array(array)) => {
-            find_elements(rest, array, *n..(*n + 1).min(array.len()), unwrap)
+            let range = *n..(*n + 1).min(array.len());
+            find_elements(rest, array, range, unwrap, fill_missing)
         }
         (Op::ArraySlice { start, stop }, Value::Array(array)) => {
             let range = slice_range(array.len(), *start, *stop);
-            find_elements(rest, array, range, unwrap)
+            find_elements(rest, array, range, unwrap, fill_missing)
         }
         (Op::Branches(branches), value) => branches
             .iter()
-            .filter_map(|branch| find(branch, value, unwrap))
+            .filter_map(|branch| find(branch, value, fill_missing))
             .reduce(Mask::union),
-        (Op::Descend, value) => descend(rest, value, unwrap),
+        (Op::Descend, value) => descend(rest, value),
         _ => None,
     }
 }
 
 /// What `ops` keep of the elements of `array` in `range`.
-fn find_elements(ops: &[Op], array: &[Value], range: Range<usize>, unwrap: bool) -> Option<Mask> {
+fn find_elements(
+    ops: &[Op],
+    array: &[Value],
+    range: Range<usize>,
+    unwrap: bool,
+    fill_missing: bool,
+) -> Option<Mask> {
     let found: BTreeMap<_, _> = range
-        .filter_map(|i| Some((i, find(ops, &array[i], unwrap)?)))
+        .filter_map(|i| Some((i, find(ops, &array[i], fill_missing)?)))
         .collect();
-    (!found.is_empty()).then_some(Mask::Array(found, unwrap && ops.is_empty()))
+    (!found.is_empty()).then_some(Mask::Array(found, unwrap))
 }
 
 /// What `ops` keep of `value` and of every value inside it, at any depth.
-fn descend(ops: &[Op], value: &Value, unwrap: bool) -> Option<Mask> {
+fn descend(ops: &[Op], value: &Value) -> Option<Mask> {
     let below = match value {
         Value::Object(obj) => {
             let found: BTreeMap<_, _> = obj
                 .iter()
-                .filter_map(|(key, value)| Some((key.clone(), descend(ops, value, unwrap)?)))
+                .filter_map(|(key, value)| Some((key.clone(), descend(ops, value)?)))
                 .collect();
             (!found.is_empty()).then_some(Mask::Object(found, false))
         }
@@ -124,13 +152,13 @@ fn descend(ops: &[Op], value: &Value, unwrap: bool) -> Option<Mask> {
             let found: BTreeMap<_, _> = array
                 .iter()
                 .enumerate()
-                .filter_map(|(i, value)| Some((i, descend(ops, value, unwrap)?)))
+                .filter_map(|(i, value)| Some((i, descend(ops, value)?)))
                 .collect();
             (!found.is_empty()).then_some(Mask::Array(found, false))
         }
         _ => None,
     };
-    match (find(ops, value, unwrap), below) {
+    match (find(ops, value, false), below) {
         (Some(here), Some(below)) => Some(here.union(below)),
         (here, below) => here.or(below),
     }
@@ -140,10 +168,17 @@ fn descend(ops: &[Op], value: &Value, unwrap: bool) -> Option<Mask> {
 fn keep(value: Value, mask: &Mask) -> Value {
     match (value, mask) {
         (Value::Object(obj), Mask::Object(keys, unwrap)) => {
-            let kept = obj.into_iter().filter_map(|(key, value)| {
-                let value = keep(value, keys.get(&key)?);
-                Some((key, value))
-            });
+            let missing = keys
+                .iter()
+                .filter(|(_, mask)| **mask == Mask::Missing)
+                .map(|(key, _)| (key.clone(), Value::Null));
+            let kept = obj
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let value = keep(value, keys.get(&key)?);
+                    Some((key, value))
+                })
+                .chain(missing);
             if *unwrap {
                 unwrapped(kept.map(|(_, value)| value).collect())
             } else {
@@ -162,7 +197,8 @@ fn keep(value: Value, mask: &Mask) -> Value {
                 Value::Array(kept)
             }
         }
-        // `Mask::All`, the only mask that can apply to any value.
+        // `Mask::All`, the only mask that can apply to any value. A missing
+        // property has no value in the input, and is added by its object.
         (value, _) => value,
     }
 }
@@ -228,14 +264,17 @@ mod tests {
             r#"{"foo":{"bar":1},"food":{"bart":3}}"#
         );
         assert_eq!(query("foo$.bar", text), r#"{"foo":{"bar":1}}"#);
-        assert_eq!(query("fo.bar$", text), r#"{"foo":{"bar":1}}"#);
+        assert_eq!(
+            query("fo.bar$", text),
+            r#"{"foo":{"bar":1},"food":{"bar":null}}"#
+        );
         assert_eq!(query("foo$.ba", text), r#"{"foo":{"bar":1,"baz":2}}"#);
     }
 
     #[test]
     fn paths_that_find_nothing_are_left_out() {
         assert_eq!(
-            query("*.age", PEOPLE),
+            query("*./age/", PEOPLE),
             r#"{"Tim":{"age":53},"Fred":{"age":50}}"#
         );
         // Steps that don't suit a value find nothing in it, rather than failing.
@@ -249,10 +288,41 @@ mod tests {
     }
 
     #[test]
+    fn a_last_name_that_matches_nothing_is_shown_as_null() {
+        let text = r#"{"Tim":{"name":"a"},"Ted":{"name":"b","nap":1},"x":2}"#;
+        assert_eq!(
+            query("*.age", PEOPLE),
+            r#"{"Tim":{"age":53},"Fred":{"age":50},"user_1":{"age":null},"user_2":{"age":null}}"#
+        );
+        assert_eq!(
+            query("T.nar", text),
+            r#"{"Tim":{"nar":null},"Ted":{"nar":null}}"#
+        );
+        assert_eq!(
+            query("T.na", text),
+            r#"{"Tim":{"name":"a"},"Ted":{"name":"b","nap":1}}"#
+        );
+        assert_eq!(query("Ted.nar$", text), r#"{"Ted":{"nar":null}}"#);
+        assert_eq!(query("nar", text), r#"{"nar":null}"#);
+        assert_eq!(query("T.nar!", text), r#"{"Tim":null,"Ted":null}"#);
+        assert_eq!(
+            query("Ted.{nap,zz}", text),
+            r#"{"Ted":{"nap":1,"zz":null}}"#
+        );
+        // Only the last step, only names, and not under `**`.
+        assert_eq!(query("T.nar.x", text), "{}");
+        assert_eq!(query("T./zz/", text), "{}");
+        assert_eq!(query("T.name.zz", text), "{}");
+        assert_eq!(query("**.zz", text), "{}");
+        assert_eq!(query("[].zz", r#"[{"a":1},2]"#), r#"[{"zz":null}]"#);
+    }
+
+    #[test]
     fn nothing_found_gives_an_empty_value() {
-        assert_eq!(query("nobody", PEOPLE), "{}");
+        assert_eq!(query("nobody.x", PEOPLE), "{}");
         assert_eq!(query("[].x", "[1,2]"), "[]");
         assert_eq!(query("x", "1"), "null");
+        assert_eq!(query("*.x", "{}"), "{}");
     }
 
     #[test]
@@ -268,7 +338,10 @@ mod tests {
     fn wildcard_and_regex_select_keys() {
         assert_eq!(query("*", PEOPLE), PEOPLE);
         assert_eq!(query("/^user_/.name", PEOPLE), query("user.name", PEOPLE));
-        assert_eq!(query("/^(Tim|Fred)$/.age", PEOPLE), query("*.age", PEOPLE));
+        assert_eq!(
+            query("/^(Tim|Fred)$/.age", PEOPLE),
+            r#"{"Tim":{"age":53},"Fred":{"age":50}}"#
+        );
         assert_eq!(query("/zzz/", PEOPLE), "{}");
     }
 
@@ -290,8 +363,12 @@ mod tests {
         assert_eq!(query("Fred.h[5]", PEOPLE), "{}");
         assert_eq!(query("Fred.h[]", PEOPLE), query("Fred.h", PEOPLE));
         let text = r#"[{"name":1},{"x":2},{"name":3,"y":4}]"#;
-        assert_eq!(query("[].name", text), r#"[{"name":1},{"name":3}]"#);
-        assert_eq!(query("[1:].name", text), r#"[{"name":3}]"#);
+        assert_eq!(query("[]./name/", text), r#"[{"name":1},{"name":3}]"#);
+        assert_eq!(
+            query("[].name", text),
+            r#"[{"name":1},{"name":null},{"name":3}]"#
+        );
+        assert_eq!(query("[1:]./name/", text), r#"[{"name":3}]"#);
         assert_eq!(query("[]", "[]"), "[]");
     }
 
@@ -320,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             query("{Tim,user_2}.{a,n}", PEOPLE),
-            r#"{"Tim":{"age":53},"user_2":{"name":"bob"}}"#
+            r#"{"Tim":{"age":53,"n":null},"user_2":{"name":"bob","a":null}}"#
         );
         // Paths into the same array are combined.
         assert_eq!(
@@ -353,9 +430,28 @@ mod tests {
     }
 
     #[test]
-    fn unwrap_replaces_the_last_level_with_its_values() {
+    fn unwrap_leaves_a_step_out_of_the_path() {
+        let text =
+            r#"{"L":{"coll":{"stamp":{"count":1},"cards":{"count":2}}},"T":{"cars":[{"n":1}]}}"#;
+        assert_eq!(query("**.car!.cou", text), r#"{"L":{"coll":{"count":2}}}"#);
+        assert_eq!(
+            query("L.c!.*!.count", text),
+            r#"{"L":[{"count":1},{"count":2}]}"#
+        );
+        assert_eq!(query("T.cars![0]!.n", text), r#"{"T":{"n":1}}"#);
+        assert_eq!(
+            query("{L.c.s!,T}", text),
+            r#"{"L":{"coll":{"count":1}},"T":{"cars":[{"n":1}]}}"#
+        );
+    }
+
+    #[test]
+    fn unwrap_at_the_end_replaces_the_last_level_with_its_values() {
         assert_eq!(query("Fred.age!", PEOPLE), r#"{"Fred":50}"#);
-        assert_eq!(query("*.age!", PEOPLE), r#"{"Tim":53,"Fred":50}"#);
+        assert_eq!(
+            query("*.age!", PEOPLE),
+            r#"{"Tim":53,"Fred":50,"user_1":null,"user_2":null}"#
+        );
         assert_eq!(
             query("user.name!", PEOPLE),
             r#"{"user_1":"ann","user_2":"bob"}"#
@@ -378,7 +474,7 @@ mod tests {
             query("Fred.*!", PEOPLE),
             r#"{"Fred":[50,["bridge","yodelling","chess"]]}"#
         );
-        assert_eq!(query("Fred.{age,h}!", PEOPLE), query("Fred.*!", PEOPLE));
-        assert_eq!(query("nobody!", PEOPLE), "{}");
+        assert_eq!(query("Fred.{age!,h!}", PEOPLE), query("Fred.*!", PEOPLE));
+        assert_eq!(query("nobody!", PEOPLE), "null");
     }
 }

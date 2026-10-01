@@ -16,6 +16,10 @@
     ]
   },
   "Lorie": {
+    "collections": {
+      "stamp": {"count": 3433},
+      "cards": {"count": 34}
+    },
     "name": "zoo",
     "age": 24,
     "hobbies": [
@@ -23,6 +27,10 @@
   },
   "Teddy": {
     "name": "quux",
+    "cars": [
+      { "name": "Herbie"},
+      { "name": "Kevin"}
+    ],
     "age": 23,
     "work": {
       "department": "accounting"

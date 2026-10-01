@@ -3,7 +3,7 @@
 A small command-line tool for filtering JSON down to the parts you want, while keeping its structure.
 
 ```sh
-jt [-C|--color] [--keep-nulls] <query> [file]
+jt [-C|--color] [--drop-nulls] <query> [file]
 ```
 
 `jt` reads JSON from `file`, or from stdin if no file is given, runs the query, and pretty-prints the result. The result is the input cut down to what the query finds. Every object and array on the way to a match is kept, holding only what leads to a match:
@@ -28,7 +28,7 @@ cat people.json | jt 'Tim.age'
 
 Output is colored, except when it is piped or redirected. Pass `-C` (or `--color`) to force color anyway, e.g. `jt -C Tim people.json | less -R`.
 
-Keys whose values are `null` are left out of the output, at any depth, so `{"a":1,"b":null}` prints as `{"a":1}`. Pass `--keep-nulls` to keep them. Nulls in arrays, and a result that is itself `null`, are always printed. The examples below show output without `--keep-nulls`.
+Pass `--drop-nulls` to leave out keys whose values are `null`, at any depth, so `{"a":1,"b":null}` prints as `{"a":1}`. Nulls in arrays, and a result that is itself `null`, are always printed.
 
 `jt --help` lists the options. To build a query interactively, seeing its result as you type, run `jti people.json` (it needs [`fzf`](https://github.com/junegunn/fzf)).
 
@@ -75,10 +75,10 @@ A query is a list of steps separated by `.`, such as `Tim.age`. Each step select
 | `{a,b.c}` | anything | everything each path in the braces selects |
 | `**.steps` | anything | everything `steps` select, at any depth |
 
-Ending a query with `!` unwraps what the last step selects: see [Unwrapping: `!`](#unwrapping-).
+A `!` after a step leaves that step's keys out of the result: see [Leaving keys out: `!`](#leaving-keys-out-).
 
 - An empty query (`''`) prints the input unchanged. It works as a JSON pretty-printer: `jt '' data.json`.
-- A query can't start with a `.`, so `.Tim.age` is an invalid query. It may end with one, which is ignored, so a query stays valid while you type it: `Tim.` is the same as `Tim`.
+- A query can't start with a `.`, so `.Tim.age` is an invalid query. It may end with one, which is ignored, so a query stays valid while you type it: `Tim.` is the same as `Tim`. For the same reason, an array step left open at the very end is closed for you: `Fred.h[` is the same as `Fred.h[]`, `Fred.h[1` as `Fred.h[1]`, and `Fred.h[1:` as `Fred.h[1:]`.
 - A step that doesn't suit a value, such as a name on an array or on a number, selects nothing from it. That path is left out, rather than causing an error.
 - When a query selects nothing, the result is `{}` for an object, `[]` for an array, and `null` for anything else.
 
@@ -93,22 +93,25 @@ A name selects every key that **starts with** it, so you only need to type enoug
 | `F.h` | `{"Fred":{"hobbies":["bridge","yodelling","chess"]}}` |
 | `user.n` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
 | `user_1` | `{"user_1":{"name":"ann"}}` |
-| `nobody` | `{}` |
+| `nobody` | `{"nobody":null}` |
+| `nobody.age` | `{}` |
 
 - `name` is the same as `/^name/`: `Tim` also selects `Timothy`. Matching is case-sensitive.
 - Use `name$` when one key is the start of another: on `{"foo":{"bar":1},"food":{"bart":2}}`, `foo.bar` gives both, and `foo$.bar` only `{"foo":{"bar":1}}`.
 - Names may contain only letters, digits, `_` and `-`. To reach a key with other characters, use a regex: `/^first name$/`.
-- A key that is selected is kept even when its value is `null`, which `--keep-nulls` shows.
+- A key that is selected is kept even when its value is `null`.
+- When the last step is a name that matches no key in an object, it is shown there with the value `null`, so you can see where it was looked for: `T.nar` gives `{"Tim":{"nar":null}}`. This only happens for the last step, and not under `**`, where it would add the name to every object.
 
 ### All properties: `*`
 
 | Query | Output |
 |---|---|
-| `*.age` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
-| `*.name` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
+| `*.age` | `{"Tim":{"age":53},"Fred":{"age":50},"user_1":{"age":null},"user_2":{"age":null}}` |
+| `*.age.x` | `{}` |
+| `*./^age$/` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
 | `Fred.*` | `{"Fred":{"age":50,"hobbies":["bridge","yodelling","chess"]}}` |
 
-Properties where the rest of the query finds nothing are left out, so `*.age` drops the users, which have no `age`.
+Properties where the rest of the query finds nothing are left out. The exception is a name as the last step, which is shown as `null` where it is missing, so `*.age` gives the users `"age":null`. To leave them out, use a regex as the last step: `*./^age$/`.
 
 ### Properties matching a regex: `/regex/`
 
@@ -147,7 +150,7 @@ The braces hold paths separated by commas. The result keeps everything any of th
 | Query | Output |
 |---|---|
 | `Fred.{age,h[0]}` | `{"Fred":{"age":50,"hobbies":["bridge"]}}` |
-| `{Tim,user_2}.{a,n}` | `{"Tim":{"age":53},"user_2":{"name":"bob"}}` |
+| `{Tim,user_2}.{a,n}` | `{"Tim":{"age":53,"n":null},"user_2":{"name":"bob","a":null}}` |
 | `Fred.h.{[0],[2]}` | `{"Fred":{"hobbies":["bridge","chess"]}}` |
 
 - A path can hold any steps, including `**` and other braces.
@@ -167,21 +170,35 @@ The braces hold paths separated by commas. The result keeps everything any of th
 - `**` needs at least one step after it, and two in a row are invalid.
 - A match inside another match is kept whole by the outer one: on `{"a":{"a":1},"b":2}`, `**.a` gives `{"a":{"a":1}}`.
 
-### Unwrapping: `!`
+### Leaving keys out: `!`
 
-Ending a query with `!` replaces each object or array that the last step selects from with what it selects. A single value is put in its place, and several are collected into an array.
+A `!` straight after a step leaves the keys or indexes it selects out of the result: the object or array it selects from is replaced by what it selects. A single value is put in its place, and several are collected into an array.
 
 | Query | Output |
 |---|---|
 | `Fred.age!` | `{"Fred":50}` |
-| `*.age!` | `{"Tim":53,"Fred":50}` |
+| `*.age!` | `{"Tim":53,"Fred":50,"user_1":null,"user_2":null}` |
 | `**.name!` | `{"user_1":"ann","user_2":"bob"}` |
 | `Fred.h[0]!` | `{"Fred":{"hobbies":"bridge"}}` |
 | `Fred.h[1:]!` | `{"Fred":{"hobbies":["yodelling","chess"]}}` |
 | `Fred.*!` | `{"Fred":[50,["bridge","yodelling","chess"]]}` |
 | `Tim!` | `{"age":53}` |
+| `Fred.h![0]` | `{"Fred":["bridge"]}` |
 
-The `!` can only go at the end of the query.
+A `!` can follow any step except `**` and `{...}`, anywhere in the query, so it can skip a level you don't need to see. On `examples/simple_object.json`, `**.car!.cou` finds `cards` inside `Lorie.collections` and leaves it out:
+
+```sh
+$ jt '**.car!.cou' examples/simple_object.json
+{
+  "Lorie": {
+    "collections": {
+      "count": 34
+    }
+  }
+}
+```
+
+Inside braces, put the `!` on the steps in each path: `Fred.{age!,h!}`.
 
 ## Errors
 
@@ -189,7 +206,7 @@ The `!` can only go at the end of the query.
 
 | Message | Cause | Example |
 |---|---|---|
-| `invalid query` | the query doesn't parse | `.Tim`, `Tim..age`, `Fred.hobbies.[0]`, `Tim[-1]`, `/(/`, `{Tim,}`, `**`, `a!.b` |
+| `invalid query` | the query doesn't parse | `.Tim`, `Tim..age`, `Fred.hobbies.[0]`, `Tim[-1]`, `/(/`, `{Tim,}`, `**`, `a!!`, `{a}!` |
 | file or JSON errors | the file is missing, or the input isn't valid JSON | |
 
 A query that parses never fails on the data: steps that don't suit a value select nothing from it.

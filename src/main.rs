@@ -3,7 +3,7 @@ mod parser;
 
 use clap::Parser;
 use colored_json::ColorMode;
-use parser::{Query, parse};
+use parser::{Op, parse};
 use serde_json::Value;
 use std::error::Error;
 use std::io::{self, IsTerminal};
@@ -17,9 +17,9 @@ struct Args {
     /// Color the output even when it is piped or redirected
     #[arg(short = 'C', long)]
     color: bool,
-    /// Keep object keys whose values are null
+    /// Leave out object keys whose values are null
     #[arg(long)]
-    keep_nulls: bool,
+    drop_nulls: bool,
     /// The query to run; '' prints the input unchanged
     query: String,
     /// The JSON file to read; stdin if omitted
@@ -38,13 +38,13 @@ fn main() -> ExitCode {
 
 /// Runs the query against the JSON in the file, or on stdin when there is no file.
 fn run(args: &Args) -> Result<(), Box<dyn Error>> {
-    let query = parse(&args.query)?;
+    let ops = parse(&args.query)?;
     let text = match &args.file {
         Some(path) => std::fs::read_to_string(path)?,
         None => io::read_to_string(io::stdin())?,
     };
-    let mut value = eval(&query, text)?;
-    if !args.keep_nulls {
+    let mut value = eval(&ops, text)?;
+    if args.drop_nulls {
         remove_null_keys(&mut value);
     }
     // Color the output unless it is redirected and color isn't forced.
@@ -70,11 +70,11 @@ fn remove_null_keys(value: &mut Value) {
     }
 }
 
-fn eval(query: &Query, text: String) -> Result<Value, Box<dyn Error>> {
+fn eval(ops: &[Op], text: String) -> Result<Value, Box<dyn Error>> {
     let json: Value = serde_json::from_str(&text)?;
     // The parsed document replaces the text, so free the text before running.
     drop(text);
-    Ok(exec::run(query, json))
+    Ok(exec::run(ops, json))
 }
 
 #[cfg(test)]
@@ -85,7 +85,7 @@ mod tests {
     fn args(query: &str, file: &str) -> Args {
         Args {
             color: false,
-            keep_nulls: false,
+            drop_nulls: false,
             query: query.to_owned(),
             file: Some(file.into()),
         }
@@ -156,11 +156,11 @@ mod tests {
 
     #[test]
     fn args_parse_flags_and_positionals() {
-        let a = Args::try_parse_from(["jt", "-C", "--keep-nulls", "a.b", "f.json"]).unwrap();
-        assert!(a.color && a.keep_nulls);
+        let a = Args::try_parse_from(["jt", "-C", "--drop-nulls", "a.b", "f.json"]).unwrap();
+        assert!(a.color && a.drop_nulls);
         assert_eq!((a.query.as_str(), a.file), ("a.b", Some("f.json".into())));
         let a = Args::try_parse_from(["jt", ""]).unwrap();
-        assert!(!a.color && !a.keep_nulls && a.query.is_empty() && a.file.is_none());
+        assert!(!a.color && !a.drop_nulls && a.query.is_empty() && a.file.is_none());
         assert!(Args::try_parse_from(["jt"]).is_err());
         assert!(Args::try_parse_from(["jt", "a", "f", "g"]).is_err());
     }
