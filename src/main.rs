@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn eval_keeps_structure() {
         assert_eq!(query("a", r#"{"a":1,"b":2}"#), r#"{"a":1}"#);
-        assert_eq!(query("a!", r#"{"a":1,"b":2}"#), "1");
+        assert_eq!(query("a^", r#"{"a":1,"b":2}"#), "1");
     }
 
     #[test]

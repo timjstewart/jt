@@ -1,5 +1,7 @@
 {
   "Tim": {
+    "address": null,
+    "active": true,
     "name": "foo",
     "age": 33,
     "hobbies": [
@@ -8,6 +10,8 @@
     "homeruns": 3
   },
   "Fred": {
+    "address": "10.1.0.132",
+    "active": true,
     "name": "bar",
     "age": 29,
     "hobbies": [
@@ -16,6 +20,7 @@
     ]
   },
   "Lorie": {
+    "active": true,
     "collections": {
       "stamp": {"count": 3433},
       "cards": {"count": 34}
@@ -26,6 +31,7 @@
     ]
   },
   "Teddy": {
+    "active": false,
     "name": "quux",
     "cars": [
       { "name": "Herbie"},

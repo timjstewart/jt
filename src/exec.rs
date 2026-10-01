@@ -5,7 +5,7 @@
 //! down to it. Working on masks lets several paths through the same value,
 //! from `{a,b}` or `**`, be combined before the output is built.
 
-use crate::parser::{Op, Pattern};
+use crate::parser::Op;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -15,16 +15,13 @@ use std::ops::Range;
 enum Mask {
     /// The whole value.
     All,
-    /// A property the query names that the object doesn't have, which is
-    /// shown as `null`.
-    Missing,
     /// Some properties of an object, and what is kept of each.
     Object(BTreeMap<String, Mask>, Unwrap),
     /// Some elements of an array, by index, and what is kept of each.
     Array(BTreeMap<usize, Mask>, Unwrap),
 }
 
-/// Whether a `!` step replaces an object or array with the values kept in
+/// Whether a `^` step replaces an object or array with the values kept in
 /// it: the one value on its own, or several in an array.
 type Unwrap = bool;
 
@@ -33,7 +30,6 @@ impl Mask {
     fn union(self, other: Mask) -> Mask {
         match (self, other) {
             (Mask::All, _) | (_, Mask::All) => Mask::All,
-            (Mask::Missing, other) | (other, Mask::Missing) => other,
             (Mask::Object(mut a, ua), Mask::Object(b, ub)) => {
                 merge(&mut a, b);
                 Mask::Object(a, ua || ub)
@@ -63,7 +59,7 @@ fn merge<K: Ord>(into: &mut BTreeMap<K, Mask>, from: BTreeMap<K, Mask>) {
 /// match is kept, holding only what leads to a match. When nothing is found,
 /// gives an empty object or array, or `null` for any other input.
 pub fn run(ops: &[Op], input: Value) -> Value {
-    match find(ops, &input, true) {
+    match find(ops, &input) {
         Some(mask) => keep(input, &mask),
         None => match input {
             Value::Object(_) => Value::Object(Default::default()),
@@ -75,11 +71,7 @@ pub fn run(ops: &[Op], input: Value) -> Value {
 
 /// What `ops` keep of `value`, or `None` if they find nothing in it. A step
 /// that doesn't suit the value, such as a name on an array, finds nothing.
-///
-/// With `fill_missing`, a name that is the last step and matches no key of an
-/// object is kept as a [`Mask::Missing`] property, so you can see where it was
-/// looked for. `**` doesn't do this, or it would add the name to every object.
-fn find(ops: &[Op], value: &Value, fill_missing: bool) -> Option<Mask> {
+fn find(ops: &[Op], value: &Value) -> Option<Mask> {
     let Some((op, rest)) = ops.split_first() else {
         return Some(Mask::All);
     };
@@ -89,51 +81,36 @@ fn find(ops: &[Op], value: &Value, fill_missing: bool) -> Option<Mask> {
     };
     match (op, value) {
         (Op::Keys(pattern), Value::Object(obj)) => {
-            let mut found: BTreeMap<_, _> = obj
+            let found: BTreeMap<_, _> = obj
                 .iter()
                 .filter(|(key, _)| pattern.is_match(key))
-                .filter_map(|(key, value)| Some((key.clone(), find(rest, value, fill_missing)?)))
+                .filter_map(|(key, value)| Some((key.clone(), find(rest, value)?)))
                 .collect();
-            if found.is_empty()
-                && fill_missing
-                && rest.is_empty()
-                && let Pattern::Prefix(name) | Pattern::Exact(name) = pattern
-                && !obj.contains_key(name)
-            {
-                found.insert(name.clone(), Mask::Missing);
-            }
             (!found.is_empty()).then_some(Mask::Object(found, unwrap))
         }
-        (Op::Array, Value::Array(array)) => {
-            find_elements(rest, array, 0..array.len(), unwrap, fill_missing)
-        }
+        (Op::Array, Value::Array(array)) => find_elements(rest, array, 0..array.len(), unwrap),
         (Op::ArrayIndex(n), Value::Array(array)) => {
             let range = *n..(*n + 1).min(array.len());
-            find_elements(rest, array, range, unwrap, fill_missing)
+            find_elements(rest, array, range, unwrap)
         }
         (Op::ArraySlice { start, stop }, Value::Array(array)) => {
             let range = slice_range(array.len(), *start, *stop);
-            find_elements(rest, array, range, unwrap, fill_missing)
+            find_elements(rest, array, range, unwrap)
         }
         (Op::Branches(branches), value) => branches
             .iter()
-            .filter_map(|branch| find(branch, value, fill_missing))
+            .filter_map(|branch| find(branch, value))
             .reduce(Mask::union),
         (Op::Descend, value) => descend(rest, value),
+        (Op::Value(comparison), value) => comparison.is_match(value).then_some(Mask::All),
         _ => None,
     }
 }
 
 /// What `ops` keep of the elements of `array` in `range`.
-fn find_elements(
-    ops: &[Op],
-    array: &[Value],
-    range: Range<usize>,
-    unwrap: bool,
-    fill_missing: bool,
-) -> Option<Mask> {
+fn find_elements(ops: &[Op], array: &[Value], range: Range<usize>, unwrap: bool) -> Option<Mask> {
     let found: BTreeMap<_, _> = range
-        .filter_map(|i| Some((i, find(ops, &array[i], fill_missing)?)))
+        .filter_map(|i| Some((i, find(ops, &array[i])?)))
         .collect();
     (!found.is_empty()).then_some(Mask::Array(found, unwrap))
 }
@@ -158,7 +135,7 @@ fn descend(ops: &[Op], value: &Value) -> Option<Mask> {
         }
         _ => None,
     };
-    match (find(ops, value, false), below) {
+    match (find(ops, value), below) {
         (Some(here), Some(below)) => Some(here.union(below)),
         (here, below) => here.or(below),
     }
@@ -168,17 +145,10 @@ fn descend(ops: &[Op], value: &Value) -> Option<Mask> {
 fn keep(value: Value, mask: &Mask) -> Value {
     match (value, mask) {
         (Value::Object(obj), Mask::Object(keys, unwrap)) => {
-            let missing = keys
-                .iter()
-                .filter(|(_, mask)| **mask == Mask::Missing)
-                .map(|(key, _)| (key.clone(), Value::Null));
-            let kept = obj
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    let value = keep(value, keys.get(&key)?);
-                    Some((key, value))
-                })
-                .chain(missing);
+            let kept = obj.into_iter().filter_map(|(key, value)| {
+                let value = keep(value, keys.get(&key)?);
+                Some((key, value))
+            });
             if *unwrap {
                 unwrapped(kept.map(|(_, value)| value).collect())
             } else {
@@ -197,8 +167,7 @@ fn keep(value: Value, mask: &Mask) -> Value {
                 Value::Array(kept)
             }
         }
-        // `Mask::All`, the only mask that can apply to any value. A missing
-        // property has no value in the input, and is added by its object.
+        // `Mask::All`, the only mask that can apply to any value.
         (value, _) => value,
     }
 }
@@ -264,10 +233,7 @@ mod tests {
             r#"{"foo":{"bar":1},"food":{"bart":3}}"#
         );
         assert_eq!(query("foo$.bar", text), r#"{"foo":{"bar":1}}"#);
-        assert_eq!(
-            query("fo.bar$", text),
-            r#"{"foo":{"bar":1},"food":{"bar":null}}"#
-        );
+        assert_eq!(query("fo.bar$", text), r#"{"foo":{"bar":1}}"#);
         assert_eq!(query("foo$.ba", text), r#"{"foo":{"bar":1,"baz":2}}"#);
     }
 
@@ -288,33 +254,74 @@ mod tests {
     }
 
     #[test]
-    fn a_last_name_that_matches_nothing_is_shown_as_null() {
-        let text = r#"{"Tim":{"name":"a"},"Ted":{"name":"b","nap":1},"x":2}"#;
+    fn names_that_match_nothing_are_left_out() {
+        let text = r#"{"Tim":{"name":"a","n":null},"Ted":{"name":"b","nap":1},"x":2}"#;
         assert_eq!(
             query("*.age", PEOPLE),
-            r#"{"Tim":{"age":53},"Fred":{"age":50},"user_1":{"age":null},"user_2":{"age":null}}"#
+            r#"{"Tim":{"age":53},"Fred":{"age":50}}"#
+        );
+        assert_eq!(query("T.nar", text), "{}");
+        assert_eq!(query("nar", text), "{}");
+        assert_eq!(query("Ted.{nap,zz}", text), r#"{"Ted":{"nap":1}}"#);
+        // Nulls that are in the input are kept.
+        assert_eq!(query("T.n$", text), r#"{"Tim":{"n":null}}"#);
+    }
+
+    #[test]
+    fn value_keeps_the_paths_to_matching_scalars() {
+        let text = r#"{"Teddy":{"cars":[{"name":"Herbie"},{"name":"Kevin"}],"age":23,"on":true},"Tim":{"name":"Hal","age":2,"x":{"name":"He"},"n":null}}"#;
+        assert_eq!(
+            query("*.car.**.name=He", text),
+            r#"{"Teddy":{"cars":[{"name":"Herbie"}]}}"#
         );
         assert_eq!(
-            query("T.nar", text),
-            r#"{"Tim":{"nar":null},"Ted":{"nar":null}}"#
+            query("**.name=He", text),
+            r#"{"Teddy":{"cars":[{"name":"Herbie"}]},"Tim":{"x":{"name":"He"}}}"#
+        );
+        assert_eq!(query("**.name=He$", text), r#"{"Tim":{"x":{"name":"He"}}}"#);
+        // Numbers and booleans compare as JSON writes them.
+        assert_eq!(
+            query("*.age=2", text),
+            r#"{"Teddy":{"age":23},"Tim":{"age":2}}"#
+        );
+        assert_eq!(query("*.age=2$", text), r#"{"Tim":{"age":2}}"#);
+        assert_eq!(query("*.on=t", text), r#"{"Teddy":{"on":true}}"#);
+        // An empty value matches every string, number, boolean and null, but
+        // not objects or arrays.
+        assert_eq!(
+            query("Tim.*=", text),
+            r#"{"Tim":{"name":"Hal","age":2,"n":null}}"#
+        );
+        assert_eq!(query("*.n=null", text), r#"{"Tim":{"n":null}}"#);
+        assert_eq!(query("*.n$!=null", text), "{}");
+        assert_eq!(
+            query("**.name=/^(He|Ha)/", text),
+            r#"{"Teddy":{"cars":[{"name":"Herbie"}]},"Tim":{"name":"Hal","x":{"name":"He"}}}"#
         );
         assert_eq!(
-            query("T.na", text),
-            r#"{"Tim":{"name":"a"},"Ted":{"name":"b","nap":1}}"#
+            query("**.name!=/^H/", text),
+            r#"{"Teddy":{"cars":[{"name":"Kevin"}]}}"#
         );
-        assert_eq!(query("Ted.nar$", text), r#"{"Ted":{"nar":null}}"#);
-        assert_eq!(query("nar", text), r#"{"nar":null}"#);
-        assert_eq!(query("T.nar!", text), r#"{"Tim":null,"Ted":null}"#);
+        assert_eq!(query("*.age!=2", text), r#"{"Teddy":{"age":23}}"#);
+        assert_eq!(query("Tim.zz=", text), "{}");
+        assert_eq!(query("Tim.x=", text), "{}");
         assert_eq!(
-            query("Ted.{nap,zz}", text),
-            r#"{"Ted":{"nap":1,"zz":null}}"#
+            query("Te.ca[].name^=K", text),
+            r#"{"Teddy":{"cars":["Kevin"]}}"#
         );
-        // Only the last step, only names, and not under `**`.
-        assert_eq!(query("T.nar.x", text), "{}");
-        assert_eq!(query("T./zz/", text), "{}");
-        assert_eq!(query("T.name.zz", text), "{}");
-        assert_eq!(query("**.zz", text), "{}");
-        assert_eq!(query("[].zz", r#"[{"a":1},2]"#), r#"[{"zz":null}]"#);
+        assert_eq!(query("=1", "12"), "12");
+    }
+
+    #[test]
+    fn not_equal_or_ordering_with_no_value_keeps_every_value() {
+        for q in ["*.age!=", "*.age<", "*.age<=", "*.age>", "*.age>="] {
+            assert_eq!(
+                query(q, PEOPLE),
+                r#"{"Tim":{"age":53},"Fred":{"age":50}}"#,
+                "{q:?}"
+            );
+        }
+        assert_eq!(query("Fred.*>", PEOPLE), query("Fred", PEOPLE));
     }
 
     #[test]
@@ -364,10 +371,7 @@ mod tests {
         assert_eq!(query("Fred.h[]", PEOPLE), query("Fred.h", PEOPLE));
         let text = r#"[{"name":1},{"x":2},{"name":3,"y":4}]"#;
         assert_eq!(query("[]./name/", text), r#"[{"name":1},{"name":3}]"#);
-        assert_eq!(
-            query("[].name", text),
-            r#"[{"name":1},{"name":null},{"name":3}]"#
-        );
+        assert_eq!(query("[].name", text), r#"[{"name":1},{"name":3}]"#);
         assert_eq!(query("[1:]./name/", text), r#"[{"name":3}]"#);
         assert_eq!(query("[]", "[]"), "[]");
     }
@@ -397,7 +401,7 @@ mod tests {
         );
         assert_eq!(
             query("{Tim,user_2}.{a,n}", PEOPLE),
-            r#"{"Tim":{"age":53,"n":null},"user_2":{"name":"bob","a":null}}"#
+            r#"{"Tim":{"age":53},"user_2":{"name":"bob"}}"#
         );
         // Paths into the same array are combined.
         assert_eq!(
@@ -433,48 +437,45 @@ mod tests {
     fn unwrap_leaves_a_step_out_of_the_path() {
         let text =
             r#"{"L":{"coll":{"stamp":{"count":1},"cards":{"count":2}}},"T":{"cars":[{"n":1}]}}"#;
-        assert_eq!(query("**.car!.cou", text), r#"{"L":{"coll":{"count":2}}}"#);
+        assert_eq!(query("**.car^.cou", text), r#"{"L":{"coll":{"count":2}}}"#);
         assert_eq!(
-            query("L.c!.*!.count", text),
+            query("L.c^.*^.count", text),
             r#"{"L":[{"count":1},{"count":2}]}"#
         );
-        assert_eq!(query("T.cars![0]!.n", text), r#"{"T":{"n":1}}"#);
+        assert_eq!(query("T.cars^[0]^.n", text), r#"{"T":{"n":1}}"#);
         assert_eq!(
-            query("{L.c.s!,T}", text),
+            query("{L.c.s^,T}", text),
             r#"{"L":{"coll":{"count":1}},"T":{"cars":[{"n":1}]}}"#
         );
     }
 
     #[test]
     fn unwrap_at_the_end_replaces_the_last_level_with_its_values() {
-        assert_eq!(query("Fred.age!", PEOPLE), r#"{"Fred":50}"#);
+        assert_eq!(query("Fred.age^", PEOPLE), r#"{"Fred":50}"#);
+        assert_eq!(query("*.age^", PEOPLE), r#"{"Tim":53,"Fred":50}"#);
         assert_eq!(
-            query("*.age!", PEOPLE),
-            r#"{"Tim":53,"Fred":50,"user_1":null,"user_2":null}"#
-        );
-        assert_eq!(
-            query("user.name!", PEOPLE),
+            query("user.name^", PEOPLE),
             r#"{"user_1":"ann","user_2":"bob"}"#
         );
-        assert_eq!(query("Tim!", PEOPLE), r#"{"age":53}"#);
+        assert_eq!(query("Tim^", PEOPLE), r#"{"age":53}"#);
         assert_eq!(
-            query("Fred.h[0]!", PEOPLE),
+            query("Fred.h[0]^", PEOPLE),
             r#"{"Fred":{"hobbies":"bridge"}}"#
         );
         assert_eq!(
-            query("Fred.h[1:]!", PEOPLE),
+            query("Fred.h[1:]^", PEOPLE),
             r#"{"Fred":{"hobbies":["yodelling","chess"]}}"#
         );
         assert_eq!(
-            query("**.name!", PEOPLE),
+            query("**.name^", PEOPLE),
             r#"{"user_1":"ann","user_2":"bob"}"#
         );
         // Several values in one object are collected into an array.
         assert_eq!(
-            query("Fred.*!", PEOPLE),
+            query("Fred.*^", PEOPLE),
             r#"{"Fred":[50,["bridge","yodelling","chess"]]}"#
         );
-        assert_eq!(query("Fred.{age!,h!}", PEOPLE), query("Fred.*!", PEOPLE));
-        assert_eq!(query("nobody!", PEOPLE), "null");
+        assert_eq!(query("Fred.{age^,h^}", PEOPLE), query("Fred.*^", PEOPLE));
+        assert_eq!(query("nobody^", PEOPLE), "{}");
     }
 }

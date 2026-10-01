@@ -15,7 +15,7 @@ $ jt 'Fred.age' people.json
     "age": 50
   }
 }
-$ jt 'Fred.age!' people.json
+$ jt 'Fred.age^' people.json
 {
   "Fred": 50
 }
@@ -32,7 +32,7 @@ Pass `--drop-nulls` to leave out keys whose values are `null`, at any depth, so 
 
 `jt --help` lists the options. To build a query interactively, seeing its result as you type, run `jti people.json` (it needs [`fzf`](https://github.com/junegunn/fzf)).
 
-Always quote the query. Characters like `*`, `[`, `$` and `!` mean something to the shell.
+Always quote the query. Characters like `*`, `[` and `$` mean something to the shell.
 
 ## Building
 
@@ -75,10 +75,10 @@ A query is a list of steps separated by `.`, such as `Tim.age`. Each step select
 | `{a,b.c}` | anything | everything each path in the braces selects |
 | `**.steps` | anything | everything `steps` select, at any depth |
 
-A `!` after a step leaves that step's keys out of the result: see [Leaving keys out: `!`](#leaving-keys-out-).
+A `^` after a step leaves that step's keys out of the result: see [Leaving keys out: `^`](#leaving-keys-out-). A query can end with a comparison such as `=value` or `<value` to keep only the paths to matching values: see [Comparing values](#comparing-values).
 
 - An empty query (`''`) prints the input unchanged. It works as a JSON pretty-printer: `jt '' data.json`.
-- A query can't start with a `.`, so `.Tim.age` is an invalid query. It may end with one, which is ignored, so a query stays valid while you type it: `Tim.` is the same as `Tim`. For the same reason, an array step left open at the very end is closed for you: `Fred.h[` is the same as `Fred.h[]`, `Fred.h[1` as `Fred.h[1]`, and `Fred.h[1:` as `Fred.h[1:]`.
+- A query can't start with a `.`, so `.Tim.age` is an invalid query. It may end with one, which is ignored, so a query stays valid while you type it: `Tim.` is the same as `Tim`. For the same reason, an array step left open at the very end is closed for you: `Fred.h[` is the same as `Fred.h[]`, `Fred.h[1` as `Fred.h[1]`, and `Fred.h[1:` as `Fred.h[1:]`. Before a comparison, the `]` is needed: `Fred.h[]=b`, not `Fred.h[=b`.
 - A step that doesn't suit a value, such as a name on an array or on a number, selects nothing from it. That path is left out, rather than causing an error.
 - When a query selects nothing, the result is `{}` for an object, `[]` for an array, and `null` for anything else.
 
@@ -93,25 +93,22 @@ A name selects every key that **starts with** it, so you only need to type enoug
 | `F.h` | `{"Fred":{"hobbies":["bridge","yodelling","chess"]}}` |
 | `user.n` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
 | `user_1` | `{"user_1":{"name":"ann"}}` |
-| `nobody` | `{"nobody":null}` |
-| `nobody.age` | `{}` |
+| `nobody` | `{}` |
 
 - `name` is the same as `/^name/`: `Tim` also selects `Timothy`. Matching is case-sensitive.
 - Use `name$` when one key is the start of another: on `{"foo":{"bar":1},"food":{"bart":2}}`, `foo.bar` gives both, and `foo$.bar` only `{"foo":{"bar":1}}`.
 - Names may contain only letters, digits, `_` and `-`. To reach a key with other characters, use a regex: `/^first name$/`.
-- A key that is selected is kept even when its value is `null`.
-- When the last step is a name that matches no key in an object, it is shown there with the value `null`, so you can see where it was looked for: `T.nar` gives `{"Tim":{"nar":null}}`. This only happens for the last step, and not under `**`, where it would add the name to every object.
+- A key that is selected is kept even when its value is `null`. A name that matches no key is left out, and never shown as `null`.
 
 ### All properties: `*`
 
 | Query | Output |
 |---|---|
-| `*.age` | `{"Tim":{"age":53},"Fred":{"age":50},"user_1":{"age":null},"user_2":{"age":null}}` |
-| `*.age.x` | `{}` |
-| `*./^age$/` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+| `*.age` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+| `*.name` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
 | `Fred.*` | `{"Fred":{"age":50,"hobbies":["bridge","yodelling","chess"]}}` |
 
-Properties where the rest of the query finds nothing are left out. The exception is a name as the last step, which is shown as `null` where it is missing, so `*.age` gives the users `"age":null`. To leave them out, use a regex as the last step: `*./^age$/`.
+Properties where the rest of the query finds nothing are left out, so `*.age` drops the users, which have no `age`.
 
 ### Properties matching a regex: `/regex/`
 
@@ -150,7 +147,7 @@ The braces hold paths separated by commas. The result keeps everything any of th
 | Query | Output |
 |---|---|
 | `Fred.{age,h[0]}` | `{"Fred":{"age":50,"hobbies":["bridge"]}}` |
-| `{Tim,user_2}.{a,n}` | `{"Tim":{"age":53,"n":null},"user_2":{"name":"bob","a":null}}` |
+| `{Tim,user_2}.{a,n}` | `{"Tim":{"age":53},"user_2":{"name":"bob"}}` |
 | `Fred.h.{[0],[2]}` | `{"Fred":{"hobbies":["bridge","chess"]}}` |
 
 - A path can hold any steps, including `**` and other braces.
@@ -170,25 +167,25 @@ The braces hold paths separated by commas. The result keeps everything any of th
 - `**` needs at least one step after it, and two in a row are invalid.
 - A match inside another match is kept whole by the outer one: on `{"a":{"a":1},"b":2}`, `**.a` gives `{"a":{"a":1}}`.
 
-### Leaving keys out: `!`
+### Leaving keys out: `^`
 
-A `!` straight after a step leaves the keys or indexes it selects out of the result: the object or array it selects from is replaced by what it selects. A single value is put in its place, and several are collected into an array.
+A `^` straight after a step leaves the keys or indexes it selects out of the result: the object or array it selects from is replaced by what it selects. A single value is put in its place, and several are collected into an array.
 
 | Query | Output |
 |---|---|
-| `Fred.age!` | `{"Fred":50}` |
-| `*.age!` | `{"Tim":53,"Fred":50,"user_1":null,"user_2":null}` |
-| `**.name!` | `{"user_1":"ann","user_2":"bob"}` |
-| `Fred.h[0]!` | `{"Fred":{"hobbies":"bridge"}}` |
-| `Fred.h[1:]!` | `{"Fred":{"hobbies":["yodelling","chess"]}}` |
-| `Fred.*!` | `{"Fred":[50,["bridge","yodelling","chess"]]}` |
-| `Tim!` | `{"age":53}` |
-| `Fred.h![0]` | `{"Fred":["bridge"]}` |
+| `Fred.age^` | `{"Fred":50}` |
+| `*.age^` | `{"Tim":53,"Fred":50}` |
+| `**.name^` | `{"user_1":"ann","user_2":"bob"}` |
+| `Fred.h[0]^` | `{"Fred":{"hobbies":"bridge"}}` |
+| `Fred.h[1:]^` | `{"Fred":{"hobbies":["yodelling","chess"]}}` |
+| `Fred.*^` | `{"Fred":[50,["bridge","yodelling","chess"]]}` |
+| `Tim^` | `{"age":53}` |
+| `Fred.h^[0]` | `{"Fred":["bridge"]}` |
 
-A `!` can follow any step except `**` and `{...}`, anywhere in the query, so it can skip a level you don't need to see. On `examples/simple_object.json`, `**.car!.cou` finds `cards` inside `Lorie.collections` and leaves it out:
+A `^` can follow any step except `**` and `{...}`, anywhere in the query, so it can skip a level you don't need to see. On `examples/simple_object.json`, `**.car^.cou` finds `cards` inside `Lorie.collections` and leaves it out:
 
 ```sh
-$ jt '**.car!.cou' examples/simple_object.json
+$ jt '**.car^.cou' examples/simple_object.json
 {
   "Lorie": {
     "collections": {
@@ -198,7 +195,91 @@ $ jt '**.car!.cou' examples/simple_object.json
 }
 ```
 
-Inside braces, put the `!` on the steps in each path: `Fred.{age!,h!}`.
+Inside braces, put the `^` on the steps in each path: `Fred.{age^,h^}`.
+
+A `^` inside a regex belongs to the regex, so `/^T/^` selects the keys that start with `T` and leaves them out.
+
+### Comparing values
+
+A query can end with a comparison: one of the operators below and a value. Only paths whose last value passes it are kept.
+
+| Operator | Keeps |
+|---|---|
+| `=value` | strings, numbers, booleans and nulls whose text **starts with** `value`, or is exactly `value` when it ends in `$` |
+| `!=value` | strings, numbers, booleans and nulls whose text isn't **exactly** `value`; with no value, every value |
+| `=/regex/` | strings that `regex` matches part of |
+| `!=/regex/` | strings that `regex` doesn't match |
+| `<value`, `<=value`, `>value`, `>=value` | numbers less than, at most, greater than or at least `value`, when `value` is a number; otherwise strings that sort before or after `value`, by character |
+
+#### Matching: `=` and `!=`
+
+| Query | Output |
+|---|---|
+| `*.age=5` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+| `*.age=50$` | `{"Fred":{"age":50}}` |
+| `**.name=b` | `{"user_2":{"name":"bob"}}` |
+| `Fred.h[]=b` | `{"Fred":{"hobbies":["bridge"]}}` |
+| `**.name=a$` | `{}` |
+| `**.name!=ann` | `{"user_2":{"name":"bob"}}` |
+| `Fred.h[]!=bridge` | `{"Fred":{"hobbies":["yodelling","chess"]}}` |
+| `*.age!=50` | `{"Tim":{"age":53}}` |
+| `*.age!=5` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+
+On `examples/simple_object.json`, `*.car.**.name=He` keeps only Teddy's car Herbie:
+
+```sh
+$ jt '*.car.**.name=He' examples/simple_object.json
+{
+  "Teddy": {
+    "cars": [
+      {
+        "name": "Herbie"
+      }
+    ]
+  }
+}
+```
+
+- Strings compare as they are, and numbers, booleans and `null` as JSON writes them: `=t` matches `true`, `=5` matches `53` and `50`, and `*.address=null` finds the addresses that are `null`. A string `"null"` matches too. Matching is case-sensitive.
+- Objects and arrays never match.
+- `=` matches a prefix, but `!=` is always exact, so `!=5` keeps `53` and `50`. A `$` after a `!=` value changes nothing.
+- An empty value matches every string, number, boolean and `null`: `Tim.*=`. With `!=`, an empty value matches every value of any type, as while you type one: `*.age!=` is the same as `*.age`.
+
+#### Regexes: `=/regex/` and `!=/regex/`
+
+| Query | Output |
+|---|---|
+| `**.name=/^(ann\|bob)$/` | `{"user_1":{"name":"ann"},"user_2":{"name":"bob"}}` |
+| `**.name!=/^a/` | `{"user_2":{"name":"bob"}}` |
+| `Fred.h[]=/ing$/` | `{"Fred":{"hobbies":["yodelling"]}}` |
+| `*.age=/5/` | `{}` |
+
+- They only compare strings: numbers, booleans and `null` never match, with `=` or `!=`.
+- As with keys, the regex only has to match **part** of the string, and uses Rust's [`regex`](https://docs.rs/regex/latest/regex/#syntax) syntax.
+- The closing `/` may be left off, as while you type: `**.name=/^a` is the same as `**.name=/^a/`. Write a literal `/` as `\/`.
+- A value starting with `/` is always a regex. To match a string starting with `/`, use a regex: `=/^\//`.
+- `!=/` and `!=//`, with nothing to match yet, keep every value, as `!=` does.
+
+#### Ordering: `<`, `<=`, `>` and `>=`
+
+| Query | Output |
+|---|---|
+| `*.age<52` | `{"Fred":{"age":50}}` |
+| `*.age>=50` | `{"Tim":{"age":53},"Fred":{"age":50}}` |
+| `**.name>b` | `{"user_2":{"name":"bob"}}` |
+| `Fred.h[]<c` | `{"Fred":{"hobbies":["bridge"]}}` |
+
+- A value that is a number, such as `5`, `-1.5` or `1e3`, compares only with numbers, by size: `*.age<100` doesn't match the string `"7"`.
+- Any other value compares only with strings, character by character, so `"Z"` sorts before `"a"`.
+- Booleans, `null`, objects and arrays never match.
+- With no value, as while you type one, they match every value of any type: `*.age<` is the same as `*.age`.
+
+#### Writing comparisons
+
+- The first `=`, `!=`, `<`, `<=`, `>` or `>=` outside a regex or braces starts the comparison, and everything after it is the value, so it can hold `.`, `=` and any other character: `a<=>x` compares with `>x`. Those characters inside a `/regex/` belong to the regex.
+- Put any `^` before the comparison: `*.age^<52`, not `*.age<52^`, whose value is `52^`.
+- After braces, the comparison applies to every path in them: `Fred.{age,h[]}=b`. A comparison can't go inside braces.
+- A `!` is only valid as part of `!=`.
 
 ## Errors
 
@@ -206,7 +287,7 @@ Inside braces, put the `!` on the steps in each path: `Fred.{age!,h!}`.
 
 | Message | Cause | Example |
 |---|---|---|
-| `invalid query` | the query doesn't parse | `.Tim`, `Tim..age`, `Fred.hobbies.[0]`, `Tim[-1]`, `/(/`, `{Tim,}`, `**`, `a!!`, `{a}!` |
+| `invalid query` | the query doesn't parse | `.Tim`, `Tim..age`, `Fred.hobbies.[0]`, `Tim[-1]`, `/(/`, `{Tim,}`, `**`, `a^^`, `{a}^` |
 | file or JSON errors | the file is missing, or the input isn't valid JSON | |
 
 A query that parses never fails on the data: steps that don't suit a value select nothing from it.
